@@ -1,37 +1,18 @@
 # workflow-driver
 
-`workflow-driver` 是一个面向工作流编排场景的通用 Python CLI。
-它将原先分散在两个脚本里的能力收敛为一个可通过 `uv` 启动的入口，并通过不同子命令执行不同类型的步骤。
+`workflow-driver` 是一个面向 workflow spec 的通用 Python CLI。
 
-当前目录已经是一个独立的 `uv` 项目，适合继续打磨后单独开源。
+它现在采用单一入口设计：
 
-## 目标
+- 只保留一个公开命令：`workflow-driver run`
+- 支持指定目标步骤 `--step-number`
+- 支持基于 `input_sources` 自动回溯依赖
+- 支持复用 `data-dir` 下已有产物
+- 模型步骤直接把真实 JSON 输入内联进 prompt，而不是只传一个本地文件路径
 
-- 单一 CLI 入口，不再让外部用户记忆多个脚本文件
-- 支持状态驱动的 workflow 执行
-- 支持脚本步骤、模型步骤、最终汇总步骤三类执行能力
-- 使用 JSON 文件作为稳定接口，便于自动化系统接入
-- 默认兼容 `uv` 运行方式，适合本地使用和 CI 集成
+## 安装
 
-## 目录结构
-
-```text
-workflow_driver/
-├── pyproject.toml
-├── README.md
-└── src/workflow_driver/
-    ├── __init__.py
-    ├── __main__.py
-    ├── cli.py
-    ├── config.py
-    ├── engine.py
-    ├── executor.py
-    └── utils.py
-```
-
-## 安装与运行
-
-如果你在当前目录下开发：
+在项目目录下：
 
 ```bash
 cd workflow_driver
@@ -39,103 +20,145 @@ uv sync
 uv run workflow-driver --help
 ```
 
-如果你在仓库根目录执行：
-
-```bash
-uv run --project workflow_driver workflow-driver --help
-```
-
 也可以直接按模块运行：
 
 ```bash
-uv run --project workflow_driver python -m workflow_driver --help
+uv run python -m workflow_driver --help
 ```
 
 ## 命令设计
 
-工具现在只有一个统一入口：`workflow-driver`
+公开命令只有一个：
 
-通过子命令区分能力：
+```bash
+workflow-driver run
+```
 
-- `workflow`：执行完整工作流状态机，兼容 `start` / `status` / `run` / `next` / `complete` / `run_script_step`
-- `script-step`：直接执行一个准备好的脚本步骤
-- `model-step`：直接执行一个准备好的模型步骤
-- `final-step`：直接执行一个准备好的最终汇总步骤
+常用参数：
 
-这就是“一个入口，通过不同命令执行不同工具”的最终形态。
+- `--spec`：workflow yaml 路径，必填
+- `--workspace`：工作区根目录，默认使用 `--spec` 对应 yaml 所在目录
+- `--data-dir`：产物目录，默认 `<workspace>/tmp`
+- `--step-number`：目标步骤号；不填则执行到最后一步
+- `--day-id`：常用状态参数 `day_id`
+- `--state key=value`：补充任意 state 参数，值支持 JSON
+- `--context key=value`：补充任意 context 参数，值支持 JSON
+- `--output`：将本次执行结果写到 JSON 文件
+- `--force`：忽略现有产物并强制重跑
+- `--gateway-url` / `--gateway-token`：模型步骤网关配置
+
+## 执行语义
+
+### 1. 指定目标步骤
+
+- 不指定 `--step-number`：从依赖角度执行到最后一步
+- 指定 `--step-number 2`：只保证第 2 步产物可用
+- 如果目标步骤依赖上游产物，driver 会自动回溯执行依赖步骤
+
+### 2. 产物复用
+
+driver 会在 `data-dir` 中查找步骤默认产物名：
+
+- 如果目标步骤产物已存在，默认直接复用
+- 如果目标步骤缺失，但依赖步骤产物存在，则只执行缺失的那一步
+- 如果依赖也缺失，则递归回溯生成
+
+### 3. 模型步骤输入
+
+对于 `model` 步骤，driver 会：
+
+1. 根据 `input_sources` 解析真实输入
+2. 如果步骤定义了 `input_builder`，先运行 builder 生成模型输入
+3. 将最终 JSON 输入直接内联到 prompt 中
+4. 再调用模型
+
+这意味着模型不再依赖“自己去读本地 JSON 文件路径”。
+
+## 路径解析规则
+
+- 如果显式传了 `--workspace`，则 `--spec` 相对 `--workspace` 解析
+- 如果未传 `--workspace`，则默认将 `workflow_spec.yaml` 所在目录视为 workspace
+- workflow yaml 内的执行相关路径相对 yaml 文件所在目录解析
+
+例如当 `workflow_spec.yaml` 位于项目根目录时：
+
+```yaml
+input_builder: scripts/build_emotion_regime_input.py
+normalizer: scripts/normalize_emotion_regime_output.py
+
+execution:
+  project_root: .
+```
+
+上面这些路径都会以 `workflow_spec.yaml` 所在目录作为基准目录解析。
 
 ## 最常用示例
 
 ### 1. 查看帮助
 
 ```bash
-uv run --project workflow_driver workflow-driver --help
+uv run workflow-driver run --help
 ```
 
-### 2. 执行完整工作流
+### 2. 执行整个 workflow
 
 ```bash
-uv run --project workflow_driver workflow-driver workflow \
-  --workspace /path/to/workspace \
-  --input /path/to/request.json \
-  --output /path/to/result.json
+uv run workflow-driver run --spec /path/to/workspace/workflow_spec.yaml --day-id 20260318 --output /path/to/run-result.json
 ```
 
-### 3. 直接执行脚本步骤
+### 3. 只执行到第 2 步
 
 ```bash
-uv run --project workflow_driver workflow-driver script-step \
-  --workspace /path/to/workspace \
-  --input /path/to/step.json \
-  --output /path/to/result.json
+uv run workflow-driver run --spec /path/to/workspace/workflow_spec.yaml --data-dir /path/to/tmp/run-20260318 --step-number 2 --day-id 20260318 --output /path/to/step2-result.json
 ```
 
-### 4. 直接执行模型步骤
+### 4. 复用已有 step1 产物，只补跑 step2
+
+如果 `data-dir` 中已经有：
+
+- `step1_day_summary_packet.json`
+
+那么执行：
 
 ```bash
-uv run --project workflow_driver workflow-driver model-step \
-  --workspace /path/to/workspace \
-  --input /path/to/step.json \
-  --output /path/to/result.json
+uv run workflow-driver run --spec /path/to/workspace/workflow_spec.yaml --data-dir /path/to/tmp/run-20260318 --step-number 2 --day-id 20260318
 ```
 
-## `workflow` 子命令接口
+driver 会自动复用 `step1`，只执行 `step2`。
 
-### 输入
+## 输入参数来源
 
-`workflow` 接收一个 JSON 请求文件，至少包含：
+### state
 
-```json
-{
-  "action": "run",
-  "spec_path": "workflow_spec.yaml",
-  "day_id": 20260318,
-  "context": {}
-}
-```
+可以通过以下方式提供 state 参数：
 
-### 可覆盖参数
+- `--day-id 20260318`
+- `--state market="cn-a"`
+- `--state extra='{"foo": 1}'`
+- `--state-file /path/to/state.json`
 
-以下 CLI 参数会覆盖输入文件中的同名字段：
+### context
 
-- `--action`
-- `--day-id`
-- `--run-id`
-- `--spec-path`
+可以通过以下方式提供 context 参数：
 
-### 输出
+- `--context mainline_concepts='["算力", "机器人"]'`
+- `--context unstable_themes='["高位抱团"]'`
+- `--context-file /path/to/context.json`
 
-输出为结构化 JSON。
-如果指定 `--output`，结果会写入文件；否则输出到 stdout。
+只有目标步骤实际依赖到的 state/context 才必须提供；未用到的参数可以省略。
 
-## 运行时配置
+## 输出结果
 
-### 路径相关
+`run` 的输出是一个结构化 JSON，主要包含：
+默认输出内容就是目标步骤的最终产物内容：
 
-- `--workspace`：工作区根目录。默认取当前目录，或环境变量 `WORKFLOW_DRIVER_WORKSPACE`
-- `--state-root`：状态与产物根目录。默认是 `<workspace>/tmp`
+- `script` 步骤：脚本产物 JSON
+- `model` 步骤：`normalizer` 之后的 JSON；如果没有 `normalizer`，则直接输出模型 JSON
+- `final` 步骤：final step 产物 JSON
 
-### 模型网关相关
+执行过程中的步骤播报、读取文件、生成文件信息会输出到 `stderr`，不会混入默认 JSON 输出。
+
+## 模型网关配置
 
 模型步骤通过 gateway 调用远端会话工具。
 
@@ -145,85 +168,71 @@ uv run --project workflow_driver workflow-driver model-step \
 - 环境变量：`WORKFLOW_DRIVER_GATEWAY_URL`、`WORKFLOW_DRIVER_GATEWAY_TOKEN`
 - 配置文件：`~/.workflow-driver/config.json`
 
-优先级是：CLI > 环境变量 > 配置文件
+优先级：CLI > 环境变量 > 配置文件
 
-### 脚本执行命令
+配置文件示例：
 
-默认情况下，脚本步骤会使用如下风格的命令执行：
+```json
+{
+  "gateway": {
+    "url": "http://localhost:18789/tools/invoke",
+    "auth": {
+      "token": "your-token"
+    }
+  }
+}
+```
+
+兼容旧格式：
+
+```json
+{
+  "gateway": {
+    "port": 18789,
+    "auth": {
+      "token": "your-token"
+    }
+  }
+}
+```
+
+## 脚本执行契约
+
+本地脚本步骤仍然通过显式 `--input/--output` 调用脚本，但这是 driver 的内部实现，不再要求调用方自己准备外部 JSON 请求文件。
+
+默认脚本执行风格：
 
 ```bash
 uv run --project <project_root> python <script_path> --input <input_path> --output <output_path>
 ```
 
-如果你的脚本运行时不是这个契约，可以通过：
+如果你需要接入自定义执行包装器，可以通过：
 
-- CLI: `--script-command-template`
-- 环境变量: `WORKFLOW_DRIVER_SCRIPT_COMMAND`
+- CLI：`--script-command-template`
+- 环境变量：`WORKFLOW_DRIVER_SCRIPT_COMMAND`
 
-来自定义命令模板。
-
-支持的占位符：
-
-- `{script_path}`
-- `{input_path}`
-- `{output_path}`
-- `{workspace}`
-- `{project_root}`
-
-例如如果你想接入自定义脚本执行包装器：
+例如：
 
 ```bash
 export WORKFLOW_DRIVER_SCRIPT_COMMAND='python {script_path} --input {input_path} --output {output_path}'
 ```
 
-## 设计说明
+## 当前状态
 
-### 1. 为什么要改成单入口
+目前这版已经支持：
 
-原实现里 `workflow_driver.py` 和 `workflow_executor.py` 都承担了对外职责，使用者需要理解两个脚本的边界。
-现在对外只有 `workflow-driver` 一个命令，内部再按模块拆分，外部心智负担更小。
+- 单命令 `run`
+- `--step-number` 单步目标执行
+- `data-dir` 产物复用
+- 依赖回溯
+- model step 真实 JSON 内联 prompt
 
-### 2. 为什么保留 JSON 文件接口
+## 后续建议
 
-工作流驱动器通常会被上层系统、调度器或其他 agent 调用。
-相比 stdin 拼接或命令行长参数，JSON 文件接口更稳定、更容易审计，也方便保留运行痕迹。
-
-### 3. 为什么保留模块化内部结构
-
-虽然对外只有一个入口，但内部仍按职责拆分：
-
-- `cli.py` 负责命令行入口
-- `engine.py` 负责工作流状态机
-- `executor.py` 负责脚本/模型/最终步骤执行
-- `config.py` 负责运行时配置与路径解析
-- `utils.py` 负责通用 IO 与时间工具
-
-这能兼顾“单入口”和“可维护性”。
-
-## 开源前建议
-
-当前目录已经具备独立发布的基础，但在正式开源前，建议再补齐以下项目级事项：
-
-- 在 `pyproject.toml` 中补充真实的项目主页、仓库和问题反馈地址
-- 明确选择许可证，并补充 `LICENSE`
-- 如果要发布到 PyPI，确认项目名 `workflow-driver` 是否可用
-- 增加 CI，如 `ruff`、`pytest`、`python -m build`
-- 增加端到端示例与最小可运行 workflow spec
-
-## 发布建议
-
-本地验证通过后，可以考虑使用以下流程：
-
-```bash
-cd workflow_driver
-uv sync
-uv run workflow-driver --help
-uv build
-```
-
-如果后续你愿意，我可以继续帮你补：
+如果准备继续开源，建议补齐：
 
 - `LICENSE`
-- `pytest` 测试
-- `ruff` / `mypy` 配置
-- GitHub Actions 发布与检查流程
+- `pytest` smoke tests
+- `ruff` / `mypy`
+- GitHub Actions CI
+- 一个最小可运行 demo spec

@@ -1,17 +1,52 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from typing import Any
 
 from .config import RuntimeContext
 from .engine import WorkflowEngine
-from .executor import execute_final_step, execute_model_step, execute_script_step
-from .utils import dump_output_json, load_input_json, read_json
+from .utils import dump_output_json, load_input_json
+
+
+def parse_value(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def parse_key_value(item: str) -> tuple[str, Any]:
+    if "=" not in item:
+        raise SystemExit(f"invalid key=value pair: {item}")
+    key, raw_value = item.split("=", 1)
+    key = key.strip()
+    if not key:
+        raise SystemExit(f"invalid empty key in pair: {item}")
+    return key, parse_value(raw_value)
+
+
+def load_mapping_file(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    data = load_input_json(path)
+    if not isinstance(data, dict):
+        raise SystemExit(f"mapping file must be a JSON object: {path}")
+    return data
+
+
+def parse_mapping_items(items: list[str] | None) -> dict[str, Any]:
+    mapping: dict[str, Any] = {}
+    for item in items or []:
+        key, value = parse_key_value(item)
+        mapping[key] = value
+    return mapping
 
 
 def add_runtime_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--workspace", help="Workspace root. Defaults to $WORKFLOW_DRIVER_WORKSPACE or current directory.")
-    parser.add_argument("--state-root", help="State and artifact root. Defaults to <workspace>/tmp.")
+    parser.add_argument("--workspace", help="Workspace root. Defaults to the directory containing --spec.")
+    parser.add_argument("--state-root", help="Driver internal state root. Defaults to <workspace>/tmp.")
     parser.add_argument("--gateway-url", help="Gateway URL for model-step execution.")
     parser.add_argument("--gateway-token", help="Gateway bearer token for model-step execution.")
     parser.add_argument("--gateway-config", help="Gateway config JSON path. Defaults to ~/.workflow-driver/config.json.")
@@ -27,39 +62,36 @@ def add_runtime_options(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="workflow-driver",
-        description="Generic workflow driver packaged as a uv-friendly Python CLI.",
+        description="Run a workflow spec with dependency backtracking and artifact reuse.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    workflow_parser = subparsers.add_parser(
-        "workflow",
-        help="Run workflow state-machine actions from a request JSON file.",
-    )
-    workflow_parser.add_argument("--input", required=True, help="Request JSON file path.")
-    workflow_parser.add_argument("--output", help="Response JSON file path.")
-    workflow_parser.add_argument("--action", help="Override request.action.")
-    workflow_parser.add_argument("--day-id", type=int, help="Override request.day_id.")
-    workflow_parser.add_argument("--run-id", help="Override request.run_id.")
-    workflow_parser.add_argument("--spec-path", help="Override request.spec_path.")
-    add_runtime_options(workflow_parser)
-
-    for command_name, help_text in (
-        ("script-step", "Execute a prepared script step payload."),
-        ("model-step", "Execute a prepared model step payload."),
-        ("final-step", "Execute a prepared final step payload."),
-    ):
-        step_parser = subparsers.add_parser(command_name, help=help_text)
-        step_parser.add_argument("--input", required=True, help="Prepared step JSON file path.")
-        step_parser.add_argument("--output", help="Result JSON file path.")
-        step_parser.add_argument("--run-id", default="manual-run", help="Run id used for model/final step context.")
-        add_runtime_options(step_parser)
+    run_parser = subparsers.add_parser("run", help="Execute a workflow spec or a single target step.")
+    run_parser.add_argument("--spec", "--spec-path", dest="spec", required=True, help="Workflow spec YAML path.")
+    run_parser.add_argument("--output", help="Optional output JSON file path.")
+    run_parser.add_argument("--data-dir", help="Artifact directory. Defaults to <workspace>/tmp.")
+    run_parser.add_argument("--step-number", type=int, help="Target step number. Defaults to the last step.")
+    run_parser.add_argument("--run-id", help="Explicit run id.")
+    run_parser.add_argument("--day-id", type=int, help="Convenience state value for day_id.")
+    run_parser.add_argument("--state-file", help="JSON object file merged into state values.")
+    run_parser.add_argument("--state", action="append", help="State key=value pair. Value supports JSON.")
+    run_parser.add_argument("--context-file", help="JSON object file merged into context values.")
+    run_parser.add_argument("--context", action="append", help="Context key=value pair. Value supports JSON.")
+    run_parser.add_argument("--callback-session-id", help="Optional callback session id for final prompt delivery.")
+    run_parser.add_argument("--callback-session-key", help="Optional callback routing key for final prompt delivery.")
+    run_parser.add_argument("--force", action="store_true", help="Force re-execution even if artifacts already exist.")
+    add_runtime_options(run_parser)
 
     return parser
 
 
 def build_runtime(args: argparse.Namespace) -> RuntimeContext:
+    workspace = getattr(args, "workspace", None)
+    spec_path = getattr(args, "spec", None)
+    if workspace is None and spec_path:
+        workspace = str(Path(spec_path).expanduser().resolve().parent)
     return RuntimeContext.from_options(
-        workspace=getattr(args, "workspace", None),
+        workspace=workspace,
         state_root=getattr(args, "state_root", None),
         gateway_url=getattr(args, "gateway_url", None),
         gateway_token=getattr(args, "gateway_token", None),
@@ -68,61 +100,41 @@ def build_runtime(args: argparse.Namespace) -> RuntimeContext:
     )
 
 
-def apply_request_overrides(request_payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    payload = dict(request_payload or {})
-    overrides = {
-        "action": args.action,
-        "day_id": args.day_id,
-        "run_id": args.run_id,
-        "spec_path": args.spec_path,
-    }
-    for key, value in overrides.items():
-        if value is not None:
-            payload[key] = value
-    return payload
+def build_run_options(args: argparse.Namespace) -> dict[str, Any]:
+    spec_path = args.spec
+    if not args.workspace:
+        spec_path = str(Path(args.spec).expanduser().resolve())
 
+    state_values = load_mapping_file(args.state_file)
+    state_values.update(parse_mapping_items(args.state))
+    context_values = load_mapping_file(args.context_file)
+    context_values.update(parse_mapping_items(args.context))
 
-def run_workflow_command(args: argparse.Namespace) -> dict[str, Any]:
-    runtime = build_runtime(args)
-    engine = WorkflowEngine(runtime)
-    request_payload = load_input_json(args.input)
-    if not isinstance(request_payload, dict):
-        raise SystemExit("workflow request payload must be a JSON object")
-    return engine.run_request(apply_request_overrides(request_payload, args))
-
-
-def load_step_payload(args: argparse.Namespace) -> tuple[RuntimeContext, dict[str, Any]]:
-    runtime = build_runtime(args)
-    step_payload = load_input_json(args.input)
-    if not isinstance(step_payload, dict):
-        raise SystemExit("step payload must be a JSON object")
-    return runtime, step_payload
-
-
-def run_step_command(args: argparse.Namespace) -> dict[str, Any]:
-    runtime, step_payload = load_step_payload(args)
-    if args.command == "script-step":
-        artifact = execute_script_step(runtime, step_payload, args.run_id)
-    elif args.command == "model-step":
-        artifact = execute_model_step(runtime, step_payload, args.run_id)
-    elif args.command == "final-step":
-        artifact = execute_final_step(runtime, step_payload, args.run_id)
-    else:
-        raise SystemExit(f"unsupported command: {args.command}")
-    artifact_data = read_json(runtime.resolve_path(artifact))
     return {
-        "artifact": artifact,
-        "artifact_data": artifact_data,
+        "spec_path": spec_path,
+        "data_dir": args.data_dir,
+        "step_number": args.step_number,
+        "run_id": args.run_id,
+        "day_id": args.day_id,
+        "state_values": state_values,
+        "context_values": context_values,
+        "callback_session_id": args.callback_session_id,
+        "callback_session_key": args.callback_session_key,
+        "force": args.force,
     }
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.command == "workflow":
-        result = run_workflow_command(args)
-    else:
-        result = run_step_command(args)
-    dump_output_json(result, args.output)
+    runtime = build_runtime(args)
+    engine = WorkflowEngine(runtime)
+
+    if args.command != "run":
+        raise SystemExit(f"unsupported command: {args.command}")
+
+    result = engine.run(build_run_options(args))
+    final_output = result.get("final_result", result)
+    dump_output_json(final_output, output=args.output)
 
 
 if __name__ == "__main__":

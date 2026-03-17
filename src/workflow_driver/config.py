@@ -52,10 +52,15 @@ class RuntimeContext:
             script_command_template=script_command_template or os.environ.get("WORKFLOW_DRIVER_SCRIPT_COMMAND"),
         )
 
-    def resolve_path(self, path_ref: str | Path) -> Path:
+    def resolve_path(self, path_ref: str | Path, *, base_dir: str | Path | None = None) -> Path:
         path = Path(path_ref).expanduser()
         if path.is_absolute():
-            return path
+            return path.resolve()
+        if base_dir is not None:
+            base_path = Path(base_dir).expanduser()
+            if not base_path.is_absolute():
+                base_path = (self.workspace / base_path).resolve()
+            return (base_path / path).resolve()
         return (self.workspace / path).resolve()
 
     def resolve_under_state_root(self, *parts: str) -> Path:
@@ -81,11 +86,12 @@ class RuntimeContext:
         cfg = json.loads(self.gateway_config.read_text(encoding="utf-8"))
         gateway = cfg.get("gateway") or {}
         auth = gateway.get("auth") or {}
+        configured_url = gateway.get("url")
         port = gateway.get("port") or 18789
         token = self.gateway_token or auth.get("token")
         if not token:
             raise RuntimeError("gateway auth token not configured")
-        url = self.gateway_url or f"http://localhost:{port}/tools/invoke"
+        url = self.gateway_url or configured_url or f"http://localhost:{port}/tools/invoke"
         return url, token
 
     def build_script_command(

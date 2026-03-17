@@ -8,13 +8,27 @@ from typing import Any
 from urllib import error, request
 
 from .config import RuntimeContext
-from .utils import read_json, write_json
+from .utils import stderr_log
 
 POLL_INTERVAL_SECONDS = 3.0
 MAX_HISTORY_MESSAGES = 50
 REPLY_SKIP_SENTINEL = "REPLY_SKIP"
 ANNOUNCE_SKIP_SENTINEL = "ANNOUNCE_SKIP"
 MODEL_SCHEMA_RETRY_LIMIT = 2
+
+
+def resolve_step_path(runtime: RuntimeContext, spec_dir: Path, path_ref: str | Path) -> Path:
+    return runtime.resolve_path(path_ref, base_dir=spec_dir)
+
+
+def resolve_step_project_root(
+    runtime: RuntimeContext,
+    spec_dir: Path,
+    project_root_ref: str | None,
+) -> Path:
+    if project_root_ref:
+        return resolve_step_path(runtime, spec_dir, project_root_ref)
+    return spec_dir
 
 
 def extract_json_object(text: str) -> Any:
@@ -68,6 +82,13 @@ def extract_json_object(text: str) -> Any:
     raise RuntimeError(f"invalid JSON result: {text[:1000]}")
 
 
+def load_json_text(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except Exception as exc:
+        raise RuntimeError(f"invalid JSON text: {text[:1000]}") from exc
+
+
 def invoke_gateway_tool(runtime: RuntimeContext, tool: str, args: dict[str, Any]) -> dict[str, Any]:
     url, token = runtime.load_gateway_settings()
     body = json.dumps({"tool": tool, "args": args}, ensure_ascii=False).encode("utf-8")
@@ -116,6 +137,10 @@ def run_python_step(
     input_path = tmp_dir / ".executor-input.json"
     output_path = tmp_dir / ".executor-output.json"
     input_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    stderr_log(
+        f"[script] 执行脚本 {script_path} "
+        f"(input={runtime.to_output_path(input_path)}, output={runtime.to_output_path(output_path)})"
+    )
     command = runtime.build_script_command(
         script_path=script_path,
         input_path=input_path,
@@ -135,93 +160,48 @@ def run_python_step(
     return output_path.read_text(encoding="utf-8")
 
 
-def resolve_payload_from_context(runtime: RuntimeContext, step_context: dict[str, Any]) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    for key, value in (step_context.get("resolved_inputs") or {}).items():
-        if isinstance(value, dict) and "artifact_path" in value and "field" in value:
-            obj = read_json(runtime.resolve_path(value["artifact_path"]))
-            payload[key] = obj.get(value["field"])
-        elif isinstance(value, dict) and "builder" in value and "builder_payload" in value:
-            builder_payload: dict[str, Any] = {}
-            for builder_key, builder_value in (value.get("builder_payload") or {}).items():
-                if isinstance(builder_value, dict) and "artifact_path" in builder_value and "field" in builder_value:
-                    obj = read_json(runtime.resolve_path(builder_value["artifact_path"]))
-                    builder_payload[builder_key] = obj[builder_value["field"]]
-                elif isinstance(builder_value, str) and builder_value.startswith("tmp/"):
-                    builder_payload[builder_key] = read_json(runtime.resolve_path(builder_value))
-                else:
-                    builder_payload[builder_key] = builder_value
-            builder_path = runtime.resolve_path(value["builder"])
-            builder_project_root = runtime.workspace
-            prepared = json.loads(
-                run_python_step(
-                    runtime,
-                    script_path=builder_path,
-                    payload=builder_payload,
-                    project_root=builder_project_root,
-                    tmp_namespace="builders",
-                ),
-            )
-            output_path = runtime.resolve_path(value["prepared_input_path"])
-            write_json(output_path, prepared)
-            payload[key] = prepared.get(key, prepared)
-        elif isinstance(value, str) and value.startswith("tmp/"):
-            obj = read_json(runtime.resolve_path(value))
-            if key == "deep_dive_request" and isinstance(obj, dict):
-                payload.update(obj)
-            else:
-                payload[key] = obj
-        else:
-            payload[key] = value
-    return payload
-
-
-def execute_script_step(
+def run_transform_script(
     runtime: RuntimeContext,
-    step: dict[str, Any],
-    run_id: str | None = None,
     *,
-    timeout_seconds: int = 600,
-) -> str:
-    del run_id, timeout_seconds
-    ctx = step["step_context"]
-    execution = step.get("execution") or {}
-    script_ref = execution.get("script_path") or step.get("script")
-    if not script_ref:
-        raise RuntimeError(f'script step {step["id"]} missing execution.script_path/script')
-    script_path = runtime.resolve_path(script_ref)
-    project_root_ref = execution.get("project_root")
-    project_root = runtime.resolve_path(project_root_ref) if project_root_ref else runtime.workspace
-    payload = resolve_payload_from_context(runtime, ctx)
-    payload_text = run_python_step(
+    script_ref: str,
+    spec_dir: Path,
+    project_root_ref: str | None,
+    payload: dict[str, Any],
+    tmp_namespace: str,
+) -> Any:
+    script_path = resolve_step_path(runtime, spec_dir, script_ref)
+    project_root = resolve_step_project_root(runtime, spec_dir, project_root_ref)
+    output_text = run_python_step(
         runtime,
         script_path=script_path,
         payload=payload,
         project_root=project_root,
-        tmp_namespace="scripts",
+        tmp_namespace=tmp_namespace,
     )
-    result = extract_json_object(payload_text)
-    out_path = runtime.resolve_path(ctx["default_artifact_path"])
-    if not out_path.exists():
-        write_json(out_path, result)
-    if not out_path.exists():
-        raise RuntimeError(f"missing script artifact after execution: {out_path}")
-    return runtime.to_output_path(out_path)
+    stderr_log(f"[script] 脚本执行完成 {script_path}")
+    return load_json_text(output_text)
 
 
-def prepare_model_input(runtime: RuntimeContext, step: dict[str, Any]) -> str:
-    ctx = step["step_context"]
-    payload = resolve_payload_from_context(runtime, ctx)
-    prepared_input_path = ctx.get("prepared_input_path")
-    if prepared_input_path:
-        path = runtime.resolve_path(prepared_input_path)
-        if not path.exists():
-            write_json(path, payload)
-    else:
-        path = runtime.resolve_path(f'{ctx["artifacts_dir"]}/step{step["number"]}_{step["id"]}_input.json')
-        write_json(path, payload)
-        prepared_input_path = runtime.to_output_path(path)
-    return prepared_input_path
+def build_model_input(
+    runtime: RuntimeContext,
+    *,
+    step: dict[str, Any],
+    spec_dir: Path,
+    raw_inputs: dict[str, Any],
+) -> Any:
+    execution = step.get("execution") or {}
+    input_builder_ref = execution.get("input_builder") or step.get("input_builder")
+    project_root_ref = execution.get("project_root")
+    if not input_builder_ref:
+        return raw_inputs
+    return run_transform_script(
+        runtime,
+        script_ref=input_builder_ref,
+        spec_dir=spec_dir,
+        project_root_ref=project_root_ref,
+        payload=raw_inputs,
+        tmp_namespace="model-builders",
+    )
 
 
 def extract_message_text(message: Any) -> str:
@@ -368,25 +348,54 @@ def run_session_model_step(
     raise RuntimeError(f"model step timed out waiting for child session result: {last_error}")
 
 
+def execute_script_step(
+    runtime: RuntimeContext,
+    *,
+    step: dict[str, Any],
+    spec_dir: Path,
+    raw_inputs: dict[str, Any],
+) -> Any:
+    execution = step.get("execution") or {}
+    script_ref = execution.get("script_path") or step.get("script")
+    if not script_ref:
+        raise RuntimeError(f'script step {step["id"]} missing execution.script_path/script')
+    project_root_ref = execution.get("project_root")
+    return run_transform_script(
+        runtime,
+        script_ref=script_ref,
+        spec_dir=spec_dir,
+        project_root_ref=project_root_ref,
+        payload=raw_inputs,
+        tmp_namespace="scripts",
+    )
+
+
 def execute_model_step(
     runtime: RuntimeContext,
-    step: dict[str, Any],
-    run_id: str,
     *,
+    step: dict[str, Any],
+    spec_dir: Path,
+    raw_inputs: dict[str, Any],
+    run_id: str,
     timeout_seconds: int = 600,
-) -> str:
-    ctx = step["step_context"]
+) -> Any:
     execution = step.get("execution") or {}
     model_cfg = execution.get("model") or {}
     agent = model_cfg.get("agent") or step.get("actor")
     if not agent:
         raise RuntimeError(f'model step {step["id"]} missing execution.model.agent')
 
-    prepared_input_path = prepare_model_input(runtime, step)
+    model_input = build_model_input(runtime, step=step, spec_dir=spec_dir, raw_inputs=raw_inputs)
+    model_input_json = json.dumps(model_input, ensure_ascii=False, indent=2)
+    stderr_log(
+        f'[model] 准备调用模型 {agent} 处理第{step["number"]}步 {step["name"]} '
+        f"(input_chars={len(model_input_json)})"
+    )
     prompt_text = step.get("prompt_text") or ""
     message_template = model_cfg.get("message_template") or (
-        "你在执行 workflow 的第{step_number}步：{step_name}。请严格只使用这个输入文件：\n"
-        "- {prepared_input_abs_path}\n\n"
+        "你在执行 workflow 的第{step_number}步：{step_name}。\n"
+        "请严格只基于下面这份输入 JSON 完成任务，不要读取或引用其他输入来源。\n\n"
+        "输入 JSON：\n{prepared_input_json}\n\n"
         "要求：\n"
         "1. 只输出严格 JSON，不要解释\n"
         "2. 不能读取或引用其他输入来源\n"
@@ -397,14 +406,13 @@ def execute_model_step(
         step_number=step["number"],
         step_name=step["name"],
         step_id=step["id"],
-        prepared_input_path=prepared_input_path,
-        prepared_input_abs_path=str(runtime.resolve_path(prepared_input_path)),
+        prepared_input_json=model_input_json,
         prompt_text=prompt_text,
         run_id=run_id,
     )
     session_label = f'{run_id}-{step["id"]}'
     project_root_ref = execution.get("project_root")
-    project_root = runtime.resolve_path(project_root_ref) if project_root_ref else runtime.workspace
+    project_root = resolve_step_project_root(runtime, spec_dir, project_root_ref)
 
     last_error: Exception | None = None
     for attempt in range(1, MODEL_SCHEMA_RETRY_LIMIT + 2):
@@ -415,6 +423,7 @@ def execute_model_step(
                 "请严格只输出合法 JSON，且必须满足本步骤既定字段结构；"
                 "不要输出解释，不要省略必填字段，不要把 object 写成 string。"
             )
+        stderr_log(f'[model] 第{step["number"]}步 {step["name"]} 发起模型请求，第 {attempt} 次尝试')
         obj = run_session_model_step(
             runtime,
             agent,
@@ -424,20 +433,19 @@ def execute_model_step(
         )
         final_obj = obj
         try:
-            if step.get("normalizer"):
-                normalizer_path = runtime.resolve_path(step["normalizer"])
-                final_obj = json.loads(
-                    run_python_step(
-                        runtime,
-                        script_path=normalizer_path,
-                        payload=obj,
-                        project_root=project_root,
-                        tmp_namespace="normalizers",
-                    ),
+            normalizer_ref = execution.get("normalizer") or step.get("normalizer")
+            if normalizer_ref:
+                stderr_log(f'[model] 第{step["number"]}步 {step["name"]} 准备执行 normalizer {normalizer_ref}')
+                final_obj = run_transform_script(
+                    runtime,
+                    script_ref=normalizer_ref,
+                    spec_dir=spec_dir,
+                    project_root_ref=str(project_root),
+                    payload=obj,
+                    tmp_namespace="normalizers",
                 )
-            out_path = runtime.resolve_path(ctx["default_artifact_path"])
-            write_json(out_path, final_obj)
-            return runtime.to_output_path(out_path)
+            stderr_log(f'[model] 第{step["number"]}步 {step["name"]} 模型执行完成')
+            return final_obj
         except Exception as exc:
             last_error = exc
             if attempt > MODEL_SCHEMA_RETRY_LIMIT:
@@ -445,39 +453,26 @@ def execute_model_step(
     raise RuntimeError(f"model output schema validation failed: {last_error}")
 
 
-def resolve_data_value(runtime: RuntimeContext, value: Any) -> Any:
-    if isinstance(value, dict) and "artifact_path" in value and "field" in value:
-        obj = read_json(runtime.resolve_path(value["artifact_path"]))
-        return obj.get(value["field"])
-    if isinstance(value, str) and value.startswith("tmp/"):
-        return read_json(runtime.resolve_path(value))
-    return value
-
-
-def execute_final_step(runtime: RuntimeContext, step: dict[str, Any], run_id: str) -> str:
-    del run_id
-    ctx = step["step_context"]
-    resolved_inputs = ctx.get("resolved_inputs") or {}
+def execute_final_step(
+    *,
+    step: dict[str, Any],
+    resolved_inputs: dict[str, Any],
+) -> dict[str, Any]:
     data_refs = step.get("data_refs") or list(resolved_inputs.keys())
-    sections: list[str] = []
     data_map: dict[str, Any] = {}
+    sections: list[str] = []
     for name in data_refs:
         if name not in resolved_inputs:
             continue
-        data_value = resolve_data_value(runtime, resolved_inputs[name])
+        data_value = resolved_inputs[name]
         data_map[name] = data_value
         sections.append(f"{name} JSON：\n{json.dumps(data_value, ensure_ascii=False, indent=2)}")
     prompt_template = step.get("prompt_template") or step.get("prompt_text") or ""
     final_prompt = prompt_template.format(data_names="、".join(data_map.keys()))
     if sections:
         final_prompt = f"{final_prompt}\n\n下面是数据：\n\n" + "\n\n".join(sections)
-    out_obj = {
+    return {
         "final_prompt": final_prompt,
         "data_refs": data_refs,
         "data_map": data_map,
     }
-    out_path = runtime.resolve_path(ctx["default_artifact_path"])
-    write_json(out_path, out_obj)
-    prompt_path = out_path.with_suffix(".prompt.txt")
-    prompt_path.write_text(final_prompt, encoding="utf-8")
-    return runtime.to_output_path(out_path)
