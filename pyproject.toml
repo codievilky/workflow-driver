@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workflow-driver"
+version = "0.1.0"
+description = "Generic workflow driver with step orchestration, script execution, and model-step bridging."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Codievilky" },
+]
+dependencies = [
+  "PyYAML",
+]
+keywords = ["workflow", "cli", "uv", "automation", "driver"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Build Tools",
+]
+
+[project.scripts]
+workflow-driver = "workflow_driver.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/workflow_driver"]
