@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+_LOG_FILE_PATH: Path | None = None
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -67,5 +69,28 @@ def dump_output_json(payload: Any, output: str | None) -> None:
         sys.stdout.write("\n")
 
 
+def configure_log_file(path: str | Path | None, *, truncate: bool = True) -> Path | None:
+    global _LOG_FILE_PATH
+    if path is None:
+        _LOG_FILE_PATH = None
+        return None
+    log_path = Path(path).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if truncate:
+        log_path.write_text("", encoding="utf-8")
+    else:
+        log_path.touch(exist_ok=True)
+    _LOG_FILE_PATH = log_path
+    return _LOG_FILE_PATH
+
+
+def current_log_file() -> Path | None:
+    return _LOG_FILE_PATH
+
+
 def stderr_log(message: str) -> None:
-    sys.stderr.write(message.rstrip() + "\n")
+    line = message.rstrip() + "\n"
+    sys.stderr.write(line)
+    if _LOG_FILE_PATH:
+        with _LOG_FILE_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line)

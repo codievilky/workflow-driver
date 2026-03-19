@@ -7,7 +7,7 @@ from typing import Any
 
 from .config import RuntimeContext
 from .engine import WorkflowEngine
-from .utils import dump_output_json, load_input_json
+from .utils import dump_output_json, load_input_json, stderr_log
 
 
 def parse_value(text: str) -> Any:
@@ -124,6 +124,16 @@ def build_run_options(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def resolve_default_output_path(runtime: RuntimeContext, result: dict[str, Any]) -> str:
+    data_dir_value = result.get("data_dir")
+    if not isinstance(data_dir_value, str) or not data_dir_value:
+        data_dir_path = runtime.state_root
+    else:
+        data_dir_path = runtime.resolve_path(data_dir_value)
+    run_id = result.get("run_id") or "workflow-driver"
+    return str(data_dir_path / f"{run_id}.result.json")
+
+
 def main() -> None:
     args = build_parser().parse_args()
     runtime = build_runtime(args)
@@ -134,7 +144,10 @@ def main() -> None:
 
     result = engine.run(build_run_options(args))
     final_output = result.get("final_result", result)
-    dump_output_json(final_output, output=args.output)
+    output_path = args.output or resolve_default_output_path(runtime, result)
+    if not args.output:
+        stderr_log(f"[io] 未指定 --output，自动写入 {output_path}")
+    dump_output_json(final_output, output=output_path)
 
 
 if __name__ == "__main__":

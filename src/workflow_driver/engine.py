@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import RuntimeContext
 from .executor import execute_final_step, execute_model_step, execute_script_step, run_transform_script
-from .utils import compact, now_iso, now_stamp, read_json, read_yaml, stderr_log, write_json
+from .utils import compact, configure_log_file, now_iso, now_stamp, read_json, read_yaml, stderr_log, write_json
 
 FINAL_RESULT_RESERVED_KEYS = {
     "final_render_payload",
@@ -52,6 +52,10 @@ class WorkflowEngine:
 
     def default_data_dir(self) -> Path:
         return self.runtime.resolve_path("tmp")
+
+    @staticmethod
+    def default_trace_log_name(run_id: str) -> str:
+        return f"{run_id}.trace.log"
 
     def artifact_path(self, run_ctx: dict[str, Any], step: dict[str, Any]) -> Path:
         return run_ctx["data_dir"] / self.default_artifact_name(step)
@@ -322,6 +326,7 @@ class WorkflowEngine:
         final_prompt: str,
     ) -> dict[str, Any]:
         if callback_session_id and self.is_uuid_like(callback_session_id):
+            self.log(f"[callback] 准备执行 openclaw session 回传 session_id={callback_session_id}")
             proc = subprocess.run(
                 [
                     "openclaw",
@@ -338,20 +343,29 @@ class WorkflowEngine:
                 capture_output=True,
             )
             if proc.returncode == 0:
+                self.log(f"[callback] openclaw session 回传成功 session_id={callback_session_id}")
                 return {
+                    "callback_cli_invoked": True,
                     "callback_status": "sent",
                     "callback_mode": "session",
                     "callback_session_id": callback_session_id,
                 }
+            callback_error = (proc.stderr or proc.stdout).strip()
+            self.log(f"[callback] openclaw session 回传失败 session_id={callback_session_id} error={callback_error}")
             return {
+                "callback_cli_invoked": True,
                 "callback_status": "failed",
                 "callback_mode": "session",
                 "callback_session_id": callback_session_id,
-                "callback_error": (proc.stderr or proc.stdout).strip(),
+                "callback_error": callback_error,
             }
 
         target = self.parse_callback_target(callback_session_key)
         if target:
+            self.log(
+                f'[callback] 准备执行 openclaw channel 回传 agent={target["agent"]} '
+                f'channel={target["channel"]} reply_to={target["reply_to"]}'
+            )
             proc = subprocess.run(
                 [
                     "openclaw",
@@ -372,19 +386,35 @@ class WorkflowEngine:
                 capture_output=True,
             )
             if proc.returncode == 0:
+                self.log(
+                    f'[callback] openclaw channel 回传成功 agent={target["agent"]} '
+                    f'channel={target["channel"]} reply_to={target["reply_to"]}'
+                )
                 return {
+                    "callback_cli_invoked": True,
                     "callback_status": "sent",
                     "callback_mode": "channel_reply",
                     "callback_target": target,
                 }
+            callback_error = (proc.stderr or proc.stdout).strip()
+            self.log(
+                f'[callback] openclaw channel 回传失败 agent={target["agent"]} '
+                f'channel={target["channel"]} reply_to={target["reply_to"]} error={callback_error}'
+            )
             return {
+                "callback_cli_invoked": True,
                 "callback_status": "failed",
                 "callback_mode": "channel_reply",
                 "callback_target": target,
-                "callback_error": (proc.stderr or proc.stdout).strip(),
+                "callback_error": callback_error,
             }
 
-        return {"callback_status": "skipped", "callback_mode": "none"}
+        self.log("[callback] 跳过 openclaw 回传：未提供可识别的 callback 目标")
+        return {
+            "callback_cli_invoked": False,
+            "callback_status": "skipped",
+            "callback_mode": "none",
+        }
 
     @staticmethod
     def build_final_result_contract(*, artifact_path: str | None, artifact_data: Any) -> dict[str, Any]:
@@ -431,6 +461,9 @@ class WorkflowEngine:
 
     def run(self, options: dict[str, Any]) -> dict[str, Any]:
         run_ctx = self.build_run_context(options)
+        run_ctx["log_path"] = run_ctx["data_dir"] / self.default_trace_log_name(run_ctx["run_id"])
+        configure_log_file(run_ctx["log_path"])
+        self.log(f'[log] 写入运行日志 {self.runtime.to_output_path(run_ctx["log_path"])}')
         self.log(
             f'[run] workflow={run_ctx["workflow_id"]} target={self.step_label(run_ctx["target_step"])} '
             f'data_dir={self.runtime.to_output_path(run_ctx["data_dir"])}'
@@ -451,6 +484,7 @@ class WorkflowEngine:
                     "kind": run_ctx["target_step"]["kind"],
                 },
                 "data_dir": self.runtime.to_output_path(run_ctx["data_dir"]),
+                "log_path": self.runtime.to_output_path(run_ctx["log_path"]),
                 "executed_steps": run_ctx["executed_steps"],
                 "reused_steps": run_ctx["reused_steps"],
                 "artifacts": {
@@ -465,7 +499,11 @@ class WorkflowEngine:
         )
         result.update(self.build_final_result_contract(artifact_path=artifact_path, artifact_data=artifact_data))
 
-        callback_info = {"callback_status": "skipped", "callback_mode": "none"}
+        callback_info = {
+            "callback_cli_invoked": False,
+            "callback_status": "skipped",
+            "callback_mode": "none",
+        }
         final_prompt_for_callback = None
         if isinstance(result.get("result_for_caller"), dict):
             final_prompt_for_callback = result["result_for_caller"].get("final_prompt")
@@ -475,6 +513,13 @@ class WorkflowEngine:
                 callback_session_key=run_ctx.get("callback_session_key"),
                 final_prompt=final_prompt_for_callback,
             )
+        else:
+            self.log("[callback] 跳过 openclaw 回传：结果中没有 final_prompt")
         result.update(callback_info)
+        self.log(
+            f'[summary] callback_cli_invoked={"yes" if result.get("callback_cli_invoked") else "no"} '
+            f'callback_status={result.get("callback_status", "unknown")} '
+            f'callback_mode={result.get("callback_mode", "unknown")}'
+        )
         result["finished_at"] = now_iso()
         return result
