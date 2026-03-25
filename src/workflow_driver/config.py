@@ -67,11 +67,7 @@ class RuntimeContext:
         return self.state_root.joinpath(*parts)
 
     def to_output_path(self, path: Path) -> str:
-        resolved = path.resolve()
-        try:
-            return str(resolved.relative_to(self.workspace))
-        except ValueError:
-            return str(resolved)
+        return str(path.resolve())
 
     def load_gateway_settings(self) -> tuple[str, str]:
         if self.gateway_url and self.gateway_token:
