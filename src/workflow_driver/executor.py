@@ -393,14 +393,10 @@ def execute_model_step(
     )
     prompt_text = step.get("prompt_text") or ""
     message_template = model_cfg.get("message_template") or (
-        "你在执行 workflow 的第{step_number}步：{step_name}。\n"
-        "请严格只基于下面这份输入 JSON 完成任务，不要读取或引用其他输入来源。\n\n"
-        "输入 JSON：\n{prepared_input_json}\n\n"
-        "要求：\n"
-        "1. 只输出严格 JSON，不要解释\n"
-        "2. 不能读取或引用其他输入来源\n"
-        "3. 如果无法完成，也要输出 JSON，并在字段内表达\n\n"
-        "请按照以下 prompt 输出：\n\n{prompt_text}"
+        "你在执行 workflow 的第{step_number}步：{step_name}。\n\n"
+        "任务要求：\n{prompt_text}\n\n"
+        "输入数据如下：\n{prepared_input_json}\n\n"
+        "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于上方输入数据，不得读取或引用其他来源；如果无法完成，也要输出 JSON 并在字段内表达。"
     )
     base_message = message_template.format(
         step_number=step["number"],
