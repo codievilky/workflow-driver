@@ -77,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--state", action="append", help="State key=value pair. Value supports JSON.")
     run_parser.add_argument("--context-file", help="JSON object file merged into context values.")
     run_parser.add_argument("--context", action="append", help="Context key=value pair. Value supports JSON.")
+    run_parser.add_argument("--skill", required=True, help="Skill name that identifies this workflow invocation.")
     run_parser.add_argument("--callback-session-id", help="Optional callback session id for final prompt delivery.")
     run_parser.add_argument("--callback-session-key", help="Optional callback routing key for final prompt delivery.")
     run_parser.add_argument("--force", action="store_true", help="Force re-execution even if artifacts already exist.")
@@ -116,6 +117,7 @@ def build_run_options(args: argparse.Namespace) -> dict[str, Any]:
         "step_number": args.step_number,
         "run_id": args.run_id,
         "day_id": args.day_id,
+        "skill": args.skill,
         "state_values": state_values,
         "context_values": context_values,
         "callback_session_id": args.callback_session_id,

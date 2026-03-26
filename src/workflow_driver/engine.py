@@ -100,6 +100,7 @@ class WorkflowEngine:
             "target_step_number": int(target_number),
             "state_values": state_values,
             "context_values": dict(options.get("context_values") or {}),
+            "skill": options.get("skill") or "",
             "force": bool(options.get("force")),
             "callback_session_id": options.get("callback_session_id"),
             "callback_session_key": options.get("callback_session_key"),
@@ -268,6 +269,7 @@ class WorkflowEngine:
                 spec_dir=run_ctx["spec_dir"],
                 raw_inputs=resolved_inputs,
                 run_id=run_ctx["run_id"],
+                skill=run_ctx["skill"],
             )
         elif step.get("kind") == "final":
             artifact_data = execute_final_step(step=step, resolved_inputs=resolved_inputs)

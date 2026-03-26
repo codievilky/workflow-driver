@@ -377,6 +377,7 @@ def execute_model_step(
     spec_dir: Path,
     raw_inputs: dict[str, Any],
     run_id: str,
+    skill: str,
     timeout_seconds: int = 600,
 ) -> Any:
     execution = step.get("execution") or {}
@@ -393,11 +394,10 @@ def execute_model_step(
     )
     prompt_text = step.get("prompt_text") or ""
     message_template = model_cfg.get("message_template") or (
-        "你在执行 workflow 的第{step_number}步：{step_name}。\n\n"
-        "本步骤所需的全部输入已包含在下方 JSON 中，禁止调用任何工具去读取当前 workflow 的历史文件"
+        "你在执行 workflow 的第{step_number}步：{step_name}（run_id={run_id}，skill={skill}）。\n\n"
         "任务要求：\n{prompt_text}\n\n"
+        "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于上方输入数据，不得读取或引用其他来源；\n\n"
         "输入数据如下：\n{prepared_input_json}\n\n"
-        "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于上方输入数据，不得读取或引用其他来源；"
     )
     base_message = message_template.format(
         step_number=step["number"],
@@ -406,6 +406,8 @@ def execute_model_step(
         prepared_input_json=model_input_json,
         prompt_text=prompt_text,
         run_id=run_id,
+        skill=skill,
+        agent=agent,
     )
     session_label = f'{run_id}-{step["id"]}'
     project_root_ref = execution.get("project_root")
