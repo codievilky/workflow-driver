@@ -395,7 +395,7 @@ def execute_model_step(
     message_template = model_cfg.get("message_template") or (
         "你在执行 workflow 的第{step_number}步：{step_name}。\n\n"    
         "任务要求：\n{prompt_text}\n\n"
-        "本步骤所需的全部输入已包含在下方 JSON 中，禁止调用任何工具去读取上下文历史文件；"
+        "本步骤所需的全部输入已包含在下方 JSON 中，禁止调用任何工具去读取当前 workflow 的历史文件；"
         "如果无法完成，也要输出 JSON 并在字段内表达原因。"        
         "输入数据如下：\n{prepared_input_json}\n\n"
         "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于上方输入数据，不得读取或引用其他来源；"
