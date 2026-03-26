@@ -299,17 +299,21 @@ def run_session_model_step(
     agent: str,
     message: str,
     *,
+    workspace: str | None = None,
     timeout_seconds: int = 600,
     session_label: str | None = None,
 ) -> Any:
+    spawn_args: dict[str, Any] = {
+        "task": session_label or "workflow-model-step",
+        "agentId": agent,
+        "cleanup": "keep",
+    }
+    if workspace:
+        spawn_args["workspace"] = workspace
     spawn_result = invoke_gateway_tool(
         runtime,
         "sessions_spawn",
-        {
-            "task": session_label or "workflow-model-step",
-            "agentId": agent,
-            "cleanup": "keep",
-        },
+        spawn_args,
     )
     child_session_key = spawn_result.get("childSessionKey")
     if not child_session_key:
@@ -394,7 +398,7 @@ def execute_model_step(
     )
     prompt_text = step.get("prompt_text") or ""
     message_template = model_cfg.get("message_template") or (
-        "你在执行 workflow 的第{step_number}步：{step_name}（run_id={run_id}，skill={skill}）。\n\n"
+        "你在执行 workflow 的第{step_number}步：{step_name}（skill={skill}）。\n\n"
         "任务要求：\n{prompt_text}\n\n"
         "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于上方输入数据，不得读取或引用其他来源；\n\n"
         "输入数据如下：\n{prepared_input_json}\n\n"
@@ -405,9 +409,7 @@ def execute_model_step(
         step_id=step["id"],
         prepared_input_json=model_input_json,
         prompt_text=prompt_text,
-        run_id=run_id,
         skill=skill,
-        agent=agent,
     )
     session_label = f'{run_id}-{step["id"]}'
     project_root_ref = execution.get("project_root")
@@ -427,6 +429,7 @@ def execute_model_step(
             runtime,
             agent,
             message,
+            workspace=str(runtime.workspace),
             timeout_seconds=timeout_seconds,
             session_label=f"{session_label}-try{attempt}",
         )
