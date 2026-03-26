@@ -18,6 +18,7 @@ class RuntimeContext:
     gateway_token: str | None
     gateway_config: Path
     script_command_template: str | None
+    debug: bool = False
 
     @classmethod
     def from_options(
@@ -29,6 +30,7 @@ class RuntimeContext:
         gateway_token: str | None = None,
         gateway_config: str | None = None,
         script_command_template: str | None = None,
+        debug: bool = False,
     ) -> "RuntimeContext":
         workspace_value = workspace or os.environ.get("WORKFLOW_DRIVER_WORKSPACE") or "."
         workspace_path = Path(workspace_value).expanduser().resolve()
@@ -43,6 +45,9 @@ class RuntimeContext:
         gateway_config_value = gateway_config or os.environ.get("WORKFLOW_DRIVER_GATEWAY_CONFIG")
         gateway_config_path = Path(gateway_config_value).expanduser() if gateway_config_value else DEFAULT_GATEWAY_CONFIG
 
+        debug_env = os.environ.get("WORKFLOW_DRIVER_DEBUG", "").strip().lower()
+        debug_value = debug or debug_env in ("1", "true", "yes")
+
         return cls(
             workspace=workspace_path,
             state_root=state_root_path.resolve(),
@@ -50,6 +55,7 @@ class RuntimeContext:
             gateway_token=gateway_token or os.environ.get("WORKFLOW_DRIVER_GATEWAY_TOKEN"),
             gateway_config=gateway_config_path,
             script_command_template=script_command_template or os.environ.get("WORKFLOW_DRIVER_SCRIPT_COMMAND"),
+            debug=debug_value,
         )
 
     def resolve_path(self, path_ref: str | Path, *, base_dir: str | Path | None = None) -> Path:

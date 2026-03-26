@@ -91,7 +91,13 @@ def load_json_text(text: str) -> Any:
 
 def invoke_gateway_tool(runtime: RuntimeContext, tool: str, args: dict[str, Any]) -> dict[str, Any]:
     url, token = runtime.load_gateway_settings()
-    body = json.dumps({"tool": tool, "args": args}, ensure_ascii=False).encode("utf-8")
+    request_body = {"tool": tool, "args": args}
+    body = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
+    if runtime.debug:
+        stderr_log(
+            f"[debug][gateway] tool={tool} url={url}\n"
+            f"[debug][gateway] request_body=\n{json.dumps(request_body, ensure_ascii=False, indent=2)}"
+        )
     req = request.Request(
         url,
         data=body,
@@ -109,6 +115,8 @@ def invoke_gateway_tool(runtime: RuntimeContext, tool: str, args: dict[str, Any]
         raise RuntimeError(f"gateway HTTP {exc.code}: {payload}") from exc
     except Exception as exc:
         raise RuntimeError(f"gateway invoke failed: {exc}") from exc
+    if runtime.debug:
+        stderr_log(f"[debug][gateway] tool={tool} raw_response=\n{payload}")
     try:
         obj = json.loads(payload)
     except Exception as exc:
@@ -425,6 +433,15 @@ def execute_model_step(
                 "不要输出解释，不要省略必填字段，不要把 object 写成 string。"
             )
         stderr_log(f'[model] 第{step["number"]}步 {step["name"]} 发起模型请求，第 {attempt} 次尝试')
+        if runtime.debug:
+            stderr_log(
+                f'[debug][model] 第{step["number"]}步 {step["name"]} 第 {attempt} 次尝试完整请求参数:\n'
+                f"  agent={agent}\n"
+                f"  session_label={session_label}-try{attempt}\n"
+                f"  workspace={runtime.workspace}\n"
+                f"  timeout_seconds={timeout_seconds}\n"
+                f"  message=\n{message}"
+            )
         obj = run_session_model_step(
             runtime,
             agent,
@@ -433,6 +450,11 @@ def execute_model_step(
             timeout_seconds=timeout_seconds,
             session_label=f"{session_label}-try{attempt}",
         )
+        if runtime.debug:
+            stderr_log(
+                f'[debug][model] 第{step["number"]}步 {step["name"]} 第 {attempt} 次尝试完整返回:\n'
+                f"{json.dumps(obj, ensure_ascii=False, indent=2)}"
+            )
         final_obj = obj
         try:
             normalizer_ref = execution.get("normalizer") or step.get("normalizer")

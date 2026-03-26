@@ -57,6 +57,12 @@ def add_runtime_options(parser: argparse.ArgumentParser) -> None:
             "Supported placeholders: {script_path}, {input_path}, {output_path}, {workspace}, {project_root}."
         ),
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable debug mode: print full model request parameters and full model responses to stderr.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,6 +104,7 @@ def build_runtime(args: argparse.Namespace) -> RuntimeContext:
         gateway_token=getattr(args, "gateway_token", None),
         gateway_config=getattr(args, "gateway_config", None),
         script_command_template=getattr(args, "script_command_template", None),
+        debug=bool(getattr(args, "debug", False)),
     )
 
 
