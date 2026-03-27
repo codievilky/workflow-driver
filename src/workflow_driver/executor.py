@@ -8,7 +8,7 @@ from typing import Any
 from urllib import error, request
 
 from .config import RuntimeContext
-from .utils import stderr_log
+from .utils import read_json, stderr_log
 
 POLL_INTERVAL_SECONDS = 3.0
 MAX_HISTORY_MESSAGES = 50
@@ -382,6 +382,55 @@ def execute_script_step(
     )
 
 
+def execute_multi_output_script_step(
+    runtime: RuntimeContext,
+    *,
+    step: dict[str, Any],
+    spec_dir: Path,
+    raw_inputs: dict[str, Any],
+    output_path: Path,
+) -> Any:
+    """Execute a script step that writes multiple output files to output_path's parent directory.
+
+    The script receives output_path as --output and uses its parent directory to write
+    all output files. Returns the parsed content of output_path (the primary output).
+    """
+    execution = step.get("execution") or {}
+    script_ref = execution.get("script_path") or step.get("script")
+    if not script_ref:
+        raise RuntimeError(f'multi-output script step {step["id"]} missing execution.script_path/script')
+    project_root_ref = execution.get("project_root")
+    project_root = resolve_step_project_root(runtime, spec_dir, project_root_ref)
+    script_path = resolve_step_path(runtime, spec_dir, script_ref)
+    tmp_dir = runtime.resolve_under_state_root(".workflow-driver-internal", "scripts")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    input_path = tmp_dir / ".executor-input.json"
+    input_path.write_text(json.dumps(raw_inputs, ensure_ascii=False, indent=2), encoding="utf-8")
+    stderr_log(
+        f"[script] 执行多输出脚本 {script_path} "
+        f"(input={runtime.to_output_path(input_path)}, "
+        f"output_dir={runtime.to_output_path(output_path.parent)})"
+    )
+    command = runtime.build_script_command(
+        script_path=script_path,
+        input_path=input_path,
+        output_path=output_path,
+        project_root=project_root,
+    )
+    proc = subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        cwd=project_root or runtime.workspace,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "").strip())
+    if not output_path.exists():
+        raise RuntimeError(f"multi-output step primary output not produced: {output_path}")
+    stderr_log(f"[script] 多输出脚本执行完成 {script_path}")
+    return read_json(output_path)
+
+
 def execute_model_step(
     runtime: RuntimeContext,
     *,
@@ -391,6 +440,7 @@ def execute_model_step(
     run_id: str,
     skill: str,
     timeout_seconds: int = 600,
+    data_dir: Path | None = None,
 ) -> Any:
     execution = step.get("execution") or {}
     model_cfg = execution.get("model") or {}
@@ -399,26 +449,53 @@ def execute_model_step(
         raise RuntimeError(f'model step {step["id"]} missing execution.model.agent')
 
     model_input = build_model_input(runtime, step=step, spec_dir=spec_dir, raw_inputs=raw_inputs)
-    model_input_json = json.dumps(model_input, ensure_ascii=False, indent=2)
-    stderr_log(
-        f'[model] 准备调用模型 {agent} 处理第{step["number"]}步 {step["name"]} '
-        f"(input_chars={len(model_input_json)})"
-    )
     prompt_text = step.get("prompt_text") or ""
-    message_template = model_cfg.get("message_template") or (
-        "你在执行 workflow 的第{step_number}步：{step_name}（skill={skill}）。\n\n"
-        "任务要求：\n{prompt_text}\n\n"
-        "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于上方输入数据，不得读取或引用其他来源；\n\n"
-        "输入数据如下：\n{prepared_input_json}\n\n"
-    )
-    base_message = message_template.format(
-        step_number=step["number"],
-        step_name=step["name"],
-        step_id=step["id"],
-        prepared_input_json=model_input_json,
-        prompt_text=prompt_text,
-        skill=skill,
-    )
+
+    if data_dir is not None:
+        model_input_path = data_dir / f'step{step["number"]}_{step["id"]}_model_input.json'
+        model_input_path.parent.mkdir(parents=True, exist_ok=True)
+        model_input_path.write_text(
+            json.dumps(model_input, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        stderr_log(
+            f'[model] 准备调用模型 {agent} 处理第{step["number"]}步 {step["name"]} '
+            f"(input_file={runtime.to_output_path(model_input_path)})"
+        )
+        message_template = model_cfg.get("message_template") or (
+            "你在执行 workflow 的第{step_number}步：{step_name}（skill={skill}）。\n\n"
+            "任务要求：\n{prompt_text}\n\n"
+            "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于输入文件中的数据，不得读取或引用其他来源；\n\n"
+            "输入数据文件：{model_input_path}\n"
+            "（请直接读取该文件获取输入数据）\n\n"
+        )
+        base_message = message_template.format(
+            step_number=step["number"],
+            step_name=step["name"],
+            step_id=step["id"],
+            model_input_path=runtime.to_output_path(model_input_path),
+            prompt_text=prompt_text,
+            skill=skill,
+        )
+    else:
+        model_input_json = json.dumps(model_input, ensure_ascii=False, indent=2)
+        stderr_log(
+            f'[model] 准备调用模型 {agent} 处理第{step["number"]}步 {step["name"]} '
+            f"(input_chars={len(model_input_json)})"
+        )
+        message_template = model_cfg.get("message_template") or (
+            "你在执行 workflow 的第{step_number}步：{step_name}（skill={skill}）。\n\n"
+            "任务要求：\n{prompt_text}\n\n"
+            "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于上方输入数据，不得读取或引用其他来源；\n\n"
+            "输入数据如下：\n{prepared_input_json}\n\n"
+        )
+        base_message = message_template.format(
+            step_number=step["number"],
+            step_name=step["name"],
+            step_id=step["id"],
+            prepared_input_json=model_input_json,
+            prompt_text=prompt_text,
+            skill=skill,
+        )
     session_label = f'{run_id}-{step["id"]}'
     project_root_ref = execution.get("project_root")
     project_root = resolve_step_project_root(runtime, spec_dir, project_root_ref)

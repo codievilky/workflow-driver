@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import RuntimeContext
-from .executor import execute_final_step, execute_model_step, execute_script_step, run_transform_script
+from .executor import execute_final_step, execute_model_step, execute_multi_output_script_step, execute_script_step, run_transform_script
 from .utils import compact, configure_log_file, now_iso, now_stamp, read_json, read_yaml, stderr_log, write_json
 
 FINAL_RESULT_RESERVED_KEYS = {
@@ -43,7 +43,26 @@ class WorkflowEngine:
 
     @staticmethod
     def default_artifact_name(step: dict[str, Any]) -> str:
+        outputs = step.get("outputs") or {}
+        if outputs:
+            first_output = next(iter(outputs.values()))
+            return first_output.get("artifact_name") or f'step{step["number"]}_{next(iter(outputs))}.json'
         return step.get("default_artifact_name") or f'step{step["number"]}_{step.get("output_key") or step["id"]}.json'
+
+    @staticmethod
+    def build_output_index(spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Build index: output_key → {"step_id": ..., "artifact_name": ...}
+
+        Covers steps that declare an `outputs` map (multi-output steps).
+        """
+        index: dict[str, dict[str, Any]] = {}
+        for step in spec.get("steps") or []:
+            for output_key, output_spec in (step.get("outputs") or {}).items():
+                index[output_key] = {
+                    "step_id": step["id"],
+                    "artifact_name": (output_spec or {}).get("artifact_name") or f"{output_key}.json",
+                }
+        return index
 
     def default_run_id(self, workflow_id: str, day_id: Any) -> str:
         if day_id is not None:
@@ -104,6 +123,7 @@ class WorkflowEngine:
             "force": bool(options.get("force")),
             "callback_session_id": options.get("callback_session_id"),
             "callback_session_key": options.get("callback_session_key"),
+            "output_index": self.build_output_index(spec),
             "artifact_cache": {},
             "artifact_paths": {},
             "executed_steps": [],
@@ -127,12 +147,25 @@ class WorkflowEngine:
             self.log(f'[input] {self.step_label(current_step)} 读取 context `{source["key"]}`')
             return run_ctx["context_values"].get(source["key"])
         if kind == "artifact":
-            producer_step = run_ctx["step_by_id"][source["artifact"]]
+            artifact_id = source["artifact"]
+            output_info = run_ctx["output_index"].get(artifact_id)
+            if output_info:
+                # Named output from a multi-output step
+                artifact_file_path = run_ctx["data_dir"] / output_info["artifact_name"]
+                self.log(
+                    f'[input] {self.step_label(current_step)} 准备读取多输出文件 '
+                    f'{self.runtime.to_output_path(artifact_file_path)} '
+                    f'(来自步骤 {output_info["step_id"]})'
+                )
+                self.ensure_step(run_ctx, output_info["step_id"])
+                return read_json(artifact_file_path)
+            # Standard single-output step
+            producer_step = run_ctx["step_by_id"][artifact_id]
             self.log(
                 f'[input] {self.step_label(current_step)} 准备读取文件 '
                 f'{self.runtime.to_output_path(self.artifact_path(run_ctx, producer_step))}'
             )
-            producer = self.ensure_step(run_ctx, source["artifact"])
+            producer = self.ensure_step(run_ctx, artifact_id)
             return producer["artifact_data"]
         if kind == "artifact_field":
             producer_step = run_ctx["step_by_id"][source["artifact"]]
@@ -255,13 +288,26 @@ class WorkflowEngine:
             f'{self.runtime.to_output_path(artifact_path)}'
         )
         resolved_inputs = self.resolve_step_inputs(run_ctx, step)
+        wrote_directly = False
         if step.get("kind") == "script":
-            artifact_data = execute_script_step(
-                self.runtime,
-                step=step,
-                spec_dir=run_ctx["spec_dir"],
-                raw_inputs=resolved_inputs,
-            )
+            if step.get("outputs"):
+                # Multi-output: pass primary output path directly so the script
+                # derives the output directory and writes all files there.
+                artifact_data = execute_multi_output_script_step(
+                    self.runtime,
+                    step=step,
+                    spec_dir=run_ctx["spec_dir"],
+                    raw_inputs=resolved_inputs,
+                    output_path=artifact_path,
+                )
+                wrote_directly = True
+            else:
+                artifact_data = execute_script_step(
+                    self.runtime,
+                    step=step,
+                    spec_dir=run_ctx["spec_dir"],
+                    raw_inputs=resolved_inputs,
+                )
         elif step.get("kind") == "model":
             artifact_data = execute_model_step(
                 self.runtime,
@@ -270,13 +316,15 @@ class WorkflowEngine:
                 raw_inputs=resolved_inputs,
                 run_id=run_ctx["run_id"],
                 skill=run_ctx["skill"],
+                data_dir=run_ctx["data_dir"],
             )
         elif step.get("kind") == "final":
             artifact_data = execute_final_step(step=step, resolved_inputs=resolved_inputs)
         else:
             raise RuntimeError(f'unsupported step kind: {step.get("kind")}')
 
-        write_json(artifact_path, artifact_data)
+        if not wrote_directly:
+            write_json(artifact_path, artifact_data)
         self.log(f'[write] 已生成文件 {self.runtime.to_output_path(artifact_path)}')
         if step.get("kind") == "final" and isinstance(artifact_data, dict) and artifact_data.get("final_prompt"):
             artifact_path.with_suffix(".prompt.txt").write_text(artifact_data["final_prompt"], encoding="utf-8")
