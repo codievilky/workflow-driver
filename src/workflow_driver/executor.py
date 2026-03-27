@@ -212,6 +212,74 @@ def build_model_input(
     )
 
 
+def build_input_refs_text(runtime: RuntimeContext, input_refs: list[dict[str, Any]]) -> str:
+    if not input_refs:
+        return ""
+
+    lines: list[str] = []
+    for ref in input_refs:
+        name = str(ref.get("name") or "").strip()
+        kind = str(ref.get("kind") or "").strip()
+        description = str(ref.get("description") or "").strip()
+        path_text = str(ref.get("path") or "").strip()
+        field = str(ref.get("field") or "").strip()
+        state_key = str(ref.get("state_key") or "").strip()
+        context_key = str(ref.get("context_key") or "").strip()
+
+        summary = description or f"输入 `{name}`"
+        line = f"- {name}：{summary}"
+
+        extra_parts: list[str] = []
+        if path_text:
+            extra_parts.append(f"文件={runtime.to_output_path(Path(path_text))}")
+        elif kind == "state" and state_key:
+            extra_parts.append(f"来源=state `{state_key}`")
+        elif kind == "context" and context_key:
+            extra_parts.append(f"来源=context `{context_key}`")
+
+        if field:
+            extra_parts.append(f"字段=`{field}`")
+
+        if extra_parts:
+            line += f"（{'，'.join(extra_parts)}）"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def materialize_input_refs(
+    runtime: RuntimeContext,
+    *,
+    step: dict[str, Any],
+    raw_inputs: dict[str, Any],
+    input_refs: list[dict[str, Any]],
+    data_dir: Path | None,
+) -> list[dict[str, Any]]:
+    ref_root = data_dir or runtime.resolve_under_state_root(".workflow-driver-internal", "model-input-refs")
+    ref_root.mkdir(parents=True, exist_ok=True)
+
+    materialized_refs: list[dict[str, Any]] = []
+    for ref in input_refs:
+        copied = dict(ref)
+        name = str(copied.get("name") or "").strip()
+        if not name:
+            continue
+
+        needs_materialize = not copied.get("path") or bool(copied.get("field"))
+        if needs_materialize:
+            output_path = ref_root / f'step{step["number"]}_{step["id"]}_{name}.json'
+            output_path.write_text(
+                json.dumps(raw_inputs.get(name), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            copied["path"] = str(output_path)
+            copied.pop("field", None)
+            copied["materialized"] = True
+        materialized_refs.append(copied)
+
+    return materialized_refs
+
+
 def extract_message_text(message: Any) -> str:
     if isinstance(message, str):
         return message
@@ -437,6 +505,7 @@ def execute_model_step(
     step: dict[str, Any],
     spec_dir: Path,
     raw_inputs: dict[str, Any],
+    input_refs: list[dict[str, Any]] | None,
     run_id: str,
     skill: str,
     timeout_seconds: int = 600,
@@ -448,54 +517,49 @@ def execute_model_step(
     if not agent:
         raise RuntimeError(f'model step {step["id"]} missing execution.model.agent')
 
-    model_input = build_model_input(runtime, step=step, spec_dir=spec_dir, raw_inputs=raw_inputs)
     prompt_text = step.get("prompt_text") or ""
+    refs = list(input_refs or [])
+    if not refs:
+        refs = [{"name": key, "kind": "raw", "description": ""} for key in raw_inputs.keys()]
+    refs = materialize_input_refs(
+        runtime,
+        step=step,
+        raw_inputs=raw_inputs,
+        input_refs=refs,
+        data_dir=data_dir,
+    )
+    input_refs_text = build_input_refs_text(runtime, refs)
 
-    if data_dir is not None:
-        model_input_path = data_dir / f'step{step["number"]}_{step["id"]}_model_input.json'
-        model_input_path.parent.mkdir(parents=True, exist_ok=True)
-        model_input_path.write_text(
-            json.dumps(model_input, ensure_ascii=False, indent=2), encoding="utf-8"
+    stderr_log(
+        f'[model] 准备调用模型 {agent} 处理第{step["number"]}步 {step["name"]} '
+        f"(input_refs={len(refs)})"
+    )
+    materialized_refs = [ref for ref in refs if ref.get("materialized")]
+    if materialized_refs:
+        materialized_summary = ", ".join(
+            f'{ref.get("name")}={runtime.to_output_path(Path(str(ref.get("path"))))}'
+            for ref in materialized_refs
+            if ref.get("name") and ref.get("path")
         )
         stderr_log(
-            f'[model] 准备调用模型 {agent} 处理第{step["number"]}步 {step["name"]} '
-            f"(input_file={runtime.to_output_path(model_input_path)})"
+            f'[model] 第{step["number"]}步 {step["name"]} '
+            f'materialized {len(materialized_refs)} 个输入文件: {materialized_summary}'
         )
-        message_template = model_cfg.get("message_template") or (
-            "你在执行 workflow 的第{step_number}步：{step_name}（skill={skill}）。\n\n"
-            "任务要求：\n{prompt_text}\n\n"
-            "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于输入文件中的数据，不得读取或引用其他来源；\n\n"
-            "输入数据文件：{model_input_path}\n"
-            "（请直接读取该文件获取输入数据）\n\n"
-        )
-        base_message = message_template.format(
-            step_number=step["number"],
-            step_name=step["name"],
-            step_id=step["id"],
-            model_input_path=runtime.to_output_path(model_input_path),
-            prompt_text=prompt_text,
-            skill=skill,
-        )
-    else:
-        model_input_json = json.dumps(model_input, ensure_ascii=False, indent=2)
-        stderr_log(
-            f'[model] 准备调用模型 {agent} 处理第{step["number"]}步 {step["name"]} '
-            f"(input_chars={len(model_input_json)})"
-        )
-        message_template = model_cfg.get("message_template") or (
-            "你在执行 workflow 的第{step_number}步：{step_name}（skill={skill}）。\n\n"
-            "任务要求：\n{prompt_text}\n\n"
-            "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于上方输入数据，不得读取或引用其他来源；\n\n"
-            "输入数据如下：\n{prepared_input_json}\n\n"
-        )
-        base_message = message_template.format(
-            step_number=step["number"],
-            step_name=step["name"],
-            step_id=step["id"],
-            prepared_input_json=model_input_json,
-            prompt_text=prompt_text,
-            skill=skill,
-        )
+    message_template = model_cfg.get("message_template") or (
+        "你在执行 workflow 的第{step_number}步：{step_name}（skill={skill}）。\n\n"
+        "任务要求：\n{prompt_text}\n\n"
+        "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于下列输入文件中的数据，不得读取或引用其他来源。\n\n"
+        "依赖输入文件：\n{input_refs_text}\n\n"
+        "请逐个读取上述输入文件获取所需数据；若某项只是源文件中的一部分，driver 已将该部分单独物化为输入文件。\n\n"
+    )
+    base_message = message_template.format(
+        step_number=step["number"],
+        step_name=step["name"],
+        step_id=step["id"],
+        input_refs_text=input_refs_text or "- 无输入文件",
+        prompt_text=prompt_text,
+        skill=skill,
+    )
     session_label = f'{run_id}-{step["id"]}'
     project_root_ref = execution.get("project_root")
     project_root = resolve_step_project_root(runtime, spec_dir, project_root_ref)

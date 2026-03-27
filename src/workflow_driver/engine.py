@@ -240,6 +240,51 @@ class WorkflowEngine:
             raise RuntimeError(f'step {step["id"]} missing required inputs: {", ".join(missing)}')
         return resolved_inputs
 
+    def build_step_input_refs(self, run_ctx: dict[str, Any], step: dict[str, Any]) -> list[dict[str, Any]]:
+        refs: list[dict[str, Any]] = []
+        input_names = list(step.get("inputs") or [])
+        if not input_names:
+            input_names = list((step.get("input_sources") or {}).keys())
+
+        for source_name in input_names:
+            source = (step.get("input_sources") or {}).get(source_name)
+            if not isinstance(source, dict):
+                continue
+
+            kind = source.get("kind")
+            ref: dict[str, Any] = {
+                "name": source_name,
+                "kind": kind,
+                "description": source.get("description") or "",
+            }
+
+            if kind == "state":
+                ref["state_key"] = source.get("key")
+            elif kind == "context":
+                ref["context_key"] = source.get("key")
+            elif kind == "artifact":
+                artifact_id = source.get("artifact")
+                output_info = run_ctx["output_index"].get(artifact_id)
+                if output_info:
+                    ref["path"] = str(run_ctx["data_dir"] / output_info["artifact_name"])
+                    ref["producer_step_id"] = output_info["step_id"]
+                elif artifact_id in run_ctx["step_by_id"]:
+                    ref["path"] = str(self.artifact_path(run_ctx, run_ctx["step_by_id"][artifact_id]))
+                    ref["producer_step_id"] = artifact_id
+            elif kind == "artifact_field":
+                artifact_id = source.get("artifact")
+                ref["field"] = source.get("field")
+                if artifact_id in run_ctx["step_by_id"]:
+                    ref["path"] = str(self.artifact_path(run_ctx, run_ctx["step_by_id"][artifact_id]))
+                    ref["producer_step_id"] = artifact_id
+            elif kind == "built":
+                ref["path"] = str(self.built_output_path(run_ctx, step, source_name, source))
+                ref["builder"] = source.get("builder")
+
+            refs.append(ref)
+
+        return refs
+
     def mark_reused(self, run_ctx: dict[str, Any], step: dict[str, Any], artifact_path: Path) -> None:
         if step["id"] in {item["id"] for item in run_ctx["reused_steps"]}:
             return
@@ -314,6 +359,7 @@ class WorkflowEngine:
                 step=step,
                 spec_dir=run_ctx["spec_dir"],
                 raw_inputs=resolved_inputs,
+                input_refs=self.build_step_input_refs(run_ctx, step),
                 run_id=run_ctx["run_id"],
                 skill=run_ctx["skill"],
                 data_dir=run_ctx["data_dir"],
