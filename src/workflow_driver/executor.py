@@ -504,12 +504,18 @@ def execute_model_step(
     for attempt in range(1, MODEL_SCHEMA_RETRY_LIMIT + 2):
         message = base_message
         if attempt > 1:
+            retry_reason = str(last_error) if last_error else "输出格式不符合要求"
+            stderr_log(
+                f'[model] 第{step["number"]}步 {step["name"]} '
+                f'发起第 {attempt} 次重试，上次失败原因: {retry_reason}'
+            )
             message += (
-                "\n\n上一次输出未通过 schema/normalizer 校验。"
+                f"\n\n上一次输出未通过 schema/normalizer 校验（失败原因：{retry_reason}）。"
                 "请严格只输出合法 JSON，且必须满足本步骤既定字段结构；"
                 "不要输出解释，不要省略必填字段，不要把 object 写成 string。"
             )
-        stderr_log(f'[model] 第{step["number"]}步 {step["name"]} 发起模型请求，第 {attempt} 次尝试')
+        else:
+            stderr_log(f'[model] 第{step["number"]}步 {step["name"]} 发起模型请求，第 {attempt} 次尝试')
         if runtime.debug:
             stderr_log(
                 f'[debug][model] 第{step["number"]}步 {step["name"]} 第 {attempt} 次尝试完整请求参数:\n'
@@ -549,8 +555,14 @@ def execute_model_step(
             return final_obj
         except Exception as exc:
             last_error = exc
+            stderr_log(
+                f'[model] 第{step["number"]}步 {step["name"]} '
+                f'第 {attempt} 次尝试 normalizer/schema 校验失败: {exc}'
+            )
             if attempt > MODEL_SCHEMA_RETRY_LIMIT:
-                raise RuntimeError(f"model output schema validation failed after retries: {exc}") from exc
+                raise RuntimeError(
+                    f"model output schema validation failed after {attempt} attempts: {exc}"
+                ) from exc
     raise RuntimeError(f"model output schema validation failed: {last_error}")
 
 
