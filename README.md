@@ -83,6 +83,8 @@ driver 会在 `data-dir` 中查找步骤默认产物名：
 - `stepN_<step_id>_tryK.prompt.md`：适合人工阅读和优化 prompt。
 - `stepN_<step_id>_tryK.request.json`：包含 provider、model、base_url、输入引用、参考文档引用和 system/user messages；不会写入 API key。
 
+为了提高模型服务端 prefix cache 命中率，实际发送给模型的 prompt 不包含 `run_id`、步骤号、步骤名、审计文件路径、输入调试文件路径、reference 本地路径等运行期元信息；这些信息只保留在审计文件元数据里。
+
 ## 路径解析规则
 
 - 如果显式传了 `--workspace`，则 `--spec` 相对 `--workspace` 解析

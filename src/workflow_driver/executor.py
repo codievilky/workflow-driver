@@ -453,24 +453,13 @@ def build_input_refs_text(runtime: RuntimeContext, input_refs: list[dict[str, An
     lines: list[str] = []
     for ref in input_refs:
         name = str(ref.get("name") or "").strip()
-        kind = str(ref.get("kind") or "").strip()
         description = str(ref.get("description") or "").strip()
-        path_text = str(ref.get("path") or "").strip()
         field = str(ref.get("field") or "").strip()
-        state_key = str(ref.get("state_key") or "").strip()
-        context_key = str(ref.get("context_key") or "").strip()
 
         summary = description or f"输入 `{name}`"
         line = f"- {name}：{summary}"
 
         extra_parts: list[str] = []
-        if path_text:
-            extra_parts.append(f"文件={runtime.to_output_path(Path(path_text))}")
-        elif kind == "state" and state_key:
-            extra_parts.append(f"来源=state `{state_key}`")
-        elif kind == "context" and context_key:
-            extra_parts.append(f"来源=context `{context_key}`")
-
         if field:
             extra_parts.append(f"字段=`{field}`")
 
@@ -622,8 +611,6 @@ def build_reference_text(
             meta_parts.append(f"类型={loaded['kind']}")
         if loaded.get("description"):
             meta_parts.append(f"用途={loaded['description']}")
-        if loaded.get("path"):
-            meta_parts.append(f"来源={runtime.to_output_path(Path(str(loaded['path'])))}")
         if loaded.get("truncated"):
             meta_parts.append("内容已按 max_chars 截断")
         meta = f"\n{'；'.join(meta_parts)}" if meta_parts else ""
@@ -658,14 +645,11 @@ def build_model_input_data_text(
         if not name:
             continue
         description = str(ref.get("description") or "").strip()
-        path_text = str(ref.get("path") or "").strip()
         value = model_inputs.get(name)
         header = f"### 输入 {idx}：{name}"
         meta_parts: list[str] = []
         if description:
             meta_parts.append(f"含义={description}")
-        if path_text:
-            meta_parts.append(f"调试文件={runtime.to_output_path(Path(path_text))}")
         meta = f"\n{'；'.join(meta_parts)}" if meta_parts else ""
         sections.append(f"{header}{meta}\n\n```json\n{format_model_data_value(value)}\n```")
     return "\n\n".join(sections)
@@ -1012,7 +996,6 @@ def execute_model_step(
 ) -> Any:
     execution = step.get("execution") or {}
     model_cfg = execution.get("model") or {}
-    agent = model_cfg.get("agent") or step.get("actor") or "model"
     api_settings = runtime.load_model_api_settings(model_cfg)
     api_timeout_seconds = int(api_settings.get("timeout_seconds") or timeout_seconds)
 
@@ -1071,7 +1054,6 @@ def execute_model_step(
             "请用中文完成当前股票复盘步骤；不要调用工具，不要读取外部文件，"
             "不要引入本次输入和参考材料之外的新事实。"
         ),
-        f"当前步骤原 actor/角色标识：{agent}。",
     ]
     if reference_text:
         system_parts.append(
@@ -1081,7 +1063,6 @@ def execute_model_step(
         )
     system_text = "\n\n".join(system_parts)
     message_template = model_cfg.get("message_template") or (
-        "你在执行 workflow 的第{step_number}步：{step_name}（skill={skill}）。\n\n"
         "任务要求：\n{prompt_text}\n\n"
         "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于下列已内联输入数据和系统参考材料，不得读取或引用其他来源。\n\n"
         "依赖输入清单：\n{input_refs_text}\n\n"
@@ -1248,7 +1229,6 @@ def execute_final_step(
 
     execution = step.get("execution") or {}
     model_cfg = execution.get("model") or {}
-    agent = model_cfg.get("agent") or step.get("actor") or "model"
     api_settings = runtime.load_model_api_settings(model_cfg)
     api_timeout_seconds = int(api_settings.get("timeout_seconds") or timeout_seconds)
 
@@ -1269,7 +1249,6 @@ def execute_final_step(
             "不要读取外部文件，不要引入本次输入和参考材料之外的新事实。"
         ),
         "只输出最终正文，不要输出 JSON，不要输出 Markdown 代码块，不要解释执行过程。",
-        f"当前步骤原 actor/角色标识：{agent}。",
     ]
     if reference_text:
         system_parts.append(
