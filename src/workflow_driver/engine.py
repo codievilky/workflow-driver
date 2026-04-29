@@ -5,6 +5,7 @@ import re
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib import error, request
 
 from .config import RuntimeContext
 from .executor import execute_final_step, execute_model_step, execute_multi_output_script_step, execute_script_step, run_transform_script
@@ -360,12 +361,26 @@ class WorkflowEngine:
                 spec_dir=run_ctx["spec_dir"],
                 raw_inputs=resolved_inputs,
                 input_refs=self.build_step_input_refs(run_ctx, step),
+                workflow_reference_sources=run_ctx["spec"].get("reference_sources"),
+                default_reference_sources=run_ctx["spec"].get("default_reference_sources")
+                or run_ctx["spec"].get("model_reference_sources"),
                 run_id=run_ctx["run_id"],
                 skill=run_ctx["skill"],
                 data_dir=run_ctx["data_dir"],
             )
         elif step.get("kind") == "final":
-            artifact_data = execute_final_step(step=step, resolved_inputs=resolved_inputs)
+            artifact_data = execute_final_step(
+                self.runtime,
+                step=step,
+                spec_dir=run_ctx["spec_dir"],
+                resolved_inputs=resolved_inputs,
+                workflow_reference_sources=run_ctx["spec"].get("reference_sources"),
+                default_reference_sources=run_ctx["spec"].get("default_reference_sources")
+                or run_ctx["spec"].get("model_reference_sources"),
+                run_id=run_ctx["run_id"],
+                skill=run_ctx["skill"],
+                data_dir=run_ctx["data_dir"],
+            )
         else:
             raise RuntimeError(f'unsupported step kind: {step.get("kind")}')
 
@@ -377,6 +392,12 @@ class WorkflowEngine:
             self.log(
                 f'[write] 已生成文件 '
                 f'{self.runtime.to_output_path(artifact_path.with_suffix(".prompt.txt"))}'
+            )
+        if step.get("kind") == "final" and isinstance(artifact_data, dict) and artifact_data.get("final_text"):
+            artifact_path.with_suffix(".txt").write_text(artifact_data["final_text"], encoding="utf-8")
+            self.log(
+                f'[write] 已生成文件 '
+                f'{self.runtime.to_output_path(artifact_path.with_suffix(".txt"))}'
             )
         run_ctx["artifact_cache"][step_id] = artifact_data
         run_ctx["artifact_paths"][step_id] = artifact_path
@@ -419,97 +440,81 @@ class WorkflowEngine:
         *,
         callback_session_id: str | None,
         callback_session_key: str | None,
-        final_prompt: str,
+        final_message: str,
     ) -> dict[str, Any]:
-        if callback_session_id and self.is_uuid_like(callback_session_id):
-            self.log(f"[callback] 准备执行 openclaw session 回传 session_id={callback_session_id}")
-            proc = subprocess.run(
-                [
-                    "openclaw",
-                    "agent",
-                    "--session-id",
-                    callback_session_id,
-                    "--message",
-                    final_prompt,
-                    "--deliver",
-                    "--json",
-                ],
-                cwd=self.runtime.workspace,
-                text=True,
-                capture_output=True,
-            )
-            if proc.returncode == 0:
-                self.log(f"[callback] openclaw session 回传成功 session_id={callback_session_id}")
-                return {
-                    "callback_cli_invoked": True,
-                    "callback_status": "sent",
-                    "callback_mode": "session",
-                    "callback_session_id": callback_session_id,
-                }
-            callback_error = (proc.stderr or proc.stdout).strip()
-            self.log(f"[callback] openclaw session 回传失败 session_id={callback_session_id} error={callback_error}")
+        settings = self.runtime.load_notification_settings()
+        if not settings.get("enabled"):
+            self.log("[callback] 跳过 HTTP 通知：notification.enabled=false")
             return {
-                "callback_cli_invoked": True,
+                "callback_cli_invoked": False,
+                "callback_status": "skipped",
+                "callback_mode": "http_notification",
+                "notification_invoked": False,
+                "notification_status": "skipped",
+            }
+        notify_url = str(settings.get("url") or "").strip()
+        if not notify_url:
+            self.log("[callback] 跳过 HTTP 通知：notification.url 为空")
+            return {
+                "callback_cli_invoked": False,
+                "callback_status": "skipped",
+                "callback_mode": "http_notification",
+                "notification_invoked": False,
+                "notification_status": "skipped",
+            }
+
+        self.log(f"[callback] 准备执行 HTTP 通知 url={notify_url}")
+        req = request.Request(
+            notify_url,
+            data=final_message.encode("utf-8"),
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=int(settings.get("timeout_seconds") or 30)) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                status_code = response.getcode()
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            self.log(f"[callback] HTTP 通知失败 status={exc.code} body={body}")
+            return {
+                "callback_cli_invoked": False,
                 "callback_status": "failed",
-                "callback_mode": "session",
+                "callback_mode": "http_notification",
+                "notification_invoked": True,
+                "notification_status": "failed",
+                "notification_url": notify_url,
+                "notification_status_code": exc.code,
+                "callback_error": body,
                 "callback_session_id": callback_session_id,
-                "callback_error": callback_error,
+                "callback_session_key": callback_session_key,
             }
-
-        target = self.parse_callback_target(callback_session_key)
-        if target:
-            self.log(
-                f'[callback] 准备执行 openclaw channel 回传 agent={target["agent"]} '
-                f'channel={target["channel"]} reply_to={target["reply_to"]}'
-            )
-            proc = subprocess.run(
-                [
-                    "openclaw",
-                    "agent",
-                    "--agent",
-                    target["agent"],
-                    "--reply-channel",
-                    target["channel"],
-                    "--reply-to",
-                    target["reply_to"],
-                    "--message",
-                    final_prompt,
-                    "--deliver",
-                    "--json",
-                ],
-                cwd=self.runtime.workspace,
-                text=True,
-                capture_output=True,
-            )
-            if proc.returncode == 0:
-                self.log(
-                    f'[callback] openclaw channel 回传成功 agent={target["agent"]} '
-                    f'channel={target["channel"]} reply_to={target["reply_to"]}'
-                )
-                return {
-                    "callback_cli_invoked": True,
-                    "callback_status": "sent",
-                    "callback_mode": "channel_reply",
-                    "callback_target": target,
-                }
-            callback_error = (proc.stderr or proc.stdout).strip()
-            self.log(
-                f'[callback] openclaw channel 回传失败 agent={target["agent"]} '
-                f'channel={target["channel"]} reply_to={target["reply_to"]} error={callback_error}'
-            )
+        except Exception as exc:
+            self.log(f"[callback] HTTP 通知失败 error={exc}")
             return {
-                "callback_cli_invoked": True,
+                "callback_cli_invoked": False,
                 "callback_status": "failed",
-                "callback_mode": "channel_reply",
-                "callback_target": target,
-                "callback_error": callback_error,
+                "callback_mode": "http_notification",
+                "notification_invoked": True,
+                "notification_status": "failed",
+                "notification_url": notify_url,
+                "callback_error": str(exc),
+                "callback_session_id": callback_session_id,
+                "callback_session_key": callback_session_key,
             }
 
-        self.log("[callback] 跳过 openclaw 回传：未提供可识别的 callback 目标")
+        self.log(f"[callback] HTTP 通知成功 status={status_code}")
         return {
             "callback_cli_invoked": False,
-            "callback_status": "skipped",
-            "callback_mode": "none",
+            "callback_status": "sent",
+            "callback_mode": "http_notification",
+            "notification_invoked": True,
+            "notification_status": "sent",
+            "notification_url": notify_url,
+            "notification_status_code": status_code,
+            "notification_response": body[:1000],
+            "callback_session_id": callback_session_id,
+            "callback_session_key": callback_session_key,
         }
 
     @staticmethod
@@ -522,6 +527,24 @@ class WorkflowEngine:
             "result_for_caller": artifact_data,
         }
         if isinstance(artifact_data, dict) and "final_prompt" in artifact_data:
+            if isinstance(artifact_data.get("final_text") or artifact_data.get("final_message"), str):
+                final_text = artifact_data.get("final_text") or artifact_data.get("final_message")
+                contract["result_kind"] = "final_text"
+                contract["final_report"] = final_text
+                contract["final_text"] = final_text
+                contract["caller_prompt"] = artifact_data.get("final_prompt")
+                contract["caller_prompt_path"] = artifact_path.replace(".json", ".prompt.txt") if artifact_path else None
+                contract["final_text_path"] = artifact_path.replace(".json", ".txt") if artifact_path else None
+                contract["result_for_caller"] = {
+                    "final_text": final_text,
+                    "final_message": final_text,
+                    "final_text_path": contract["final_text_path"],
+                    "final_prompt": artifact_data.get("final_prompt"),
+                    "final_prompt_path": contract["caller_prompt_path"],
+                    "data_refs": artifact_data.get("data_refs") or [],
+                }
+                contract["render_prompt"] = final_text
+                return contract
             contract["result_kind"] = "final_prompt"
             contract["caller_prompt"] = artifact_data.get("final_prompt")
             contract["caller_prompt_path"] = artifact_path.replace(".json", ".prompt.txt") if artifact_path else None
@@ -600,17 +623,24 @@ class WorkflowEngine:
             "callback_status": "skipped",
             "callback_mode": "none",
         }
-        final_prompt_for_callback = None
+        final_message_for_callback = None
         if isinstance(result.get("result_for_caller"), dict):
-            final_prompt_for_callback = result["result_for_caller"].get("final_prompt")
-        if isinstance(final_prompt_for_callback, str) and final_prompt_for_callback.strip():
+            caller_result = result["result_for_caller"]
+            for message_key in ("final_text", "final_message", "render_prompt", "final_prompt"):
+                value = caller_result.get(message_key)
+                if isinstance(value, str) and value.strip():
+                    final_message_for_callback = value
+                    break
+        if not final_message_for_callback and isinstance(result.get("render_prompt"), str):
+            final_message_for_callback = result["render_prompt"]
+        if isinstance(final_message_for_callback, str) and final_message_for_callback.strip():
             callback_info = self.send_callback(
                 callback_session_id=run_ctx.get("callback_session_id"),
                 callback_session_key=run_ctx.get("callback_session_key"),
-                final_prompt=final_prompt_for_callback,
+                final_message=final_message_for_callback,
             )
         else:
-            self.log("[callback] 跳过 openclaw 回传：结果中没有 final_prompt")
+            self.log("[callback] 跳过 HTTP 通知：结果中没有可通知文本")
         result.update(callback_info)
         self.log(
             f'[summary] callback_cli_invoked={"yes" if result.get("callback_cli_invoked") else "no"} '

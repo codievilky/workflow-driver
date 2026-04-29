@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -87,6 +88,239 @@ def load_json_text(text: str) -> Any:
         return json.loads(text)
     except Exception as exc:
         raise RuntimeError(f"invalid JSON text: {text[:1000]}") from exc
+
+
+def safe_filename_part(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+    return text.strip("._") or "item"
+
+
+def join_api_url(base_url: str, suffix: str) -> str:
+    clean_base = base_url.rstrip("/")
+    clean_suffix = suffix.strip("/")
+    if clean_base.endswith(f"/{clean_suffix}"):
+        return clean_base
+    return f"{clean_base}/{clean_suffix}"
+
+
+def post_json(
+    runtime: RuntimeContext,
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout_seconds: int,
+    debug_label: str,
+) -> dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if runtime.debug:
+        stderr_log(
+            f"[debug][{debug_label}] url={url}\n"
+            f"[debug][{debug_label}] request_body=\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+        )
+    req = request.Request(
+        url,
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=timeout_seconds) as response:
+            raw = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{debug_label} HTTP {exc.code}: {raw}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"{debug_label} request failed: {exc}") from exc
+    if runtime.debug:
+        stderr_log(f"[debug][{debug_label}] raw_response=\n{raw}")
+    try:
+        obj = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"invalid {debug_label} JSON: {raw[:1000]}") from exc
+    return obj
+
+
+def extract_text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif isinstance(item.get("content"), str):
+                    parts.append(item["content"])
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def extract_model_response_text(provider: str, response_obj: dict[str, Any]) -> str:
+    if provider == "openai":
+        choices = response_obj.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                message = first.get("message")
+                if isinstance(message, dict):
+                    text = extract_text_from_content(message.get("content"))
+                    if text:
+                        return text
+                text = extract_text_from_content(first.get("text"))
+                if text:
+                    return text
+        output_text = response_obj.get("output_text")
+        if isinstance(output_text, str):
+            return output_text
+    if provider == "anthropic":
+        text = extract_text_from_content(response_obj.get("content"))
+        if text:
+            return text
+    raise RuntimeError(f"model response text not found: {json.dumps(response_obj, ensure_ascii=False)[:1000]}")
+
+
+def invoke_openai_model(
+    runtime: RuntimeContext,
+    *,
+    settings: dict[str, Any],
+    messages: list[dict[str, str]],
+    timeout_seconds: int,
+) -> str:
+    payload: dict[str, Any] = {
+        "model": settings["model"],
+        "messages": messages,
+    }
+    max_tokens_param = str(settings.get("max_tokens_param") or "max_tokens")
+    payload[max_tokens_param] = settings["max_tokens"]
+    if settings.get("temperature") is not None:
+        payload["temperature"] = settings["temperature"]
+    response_format = settings.get("response_format")
+    if response_format:
+        if isinstance(response_format, dict):
+            payload["response_format"] = response_format
+        elif str(response_format).strip() == "json_object":
+            payload["response_format"] = {"type": "json_object"}
+
+    headers = {
+        "Authorization": f"Bearer {settings['api_key']}",
+        "Content-Type": "application/json",
+    }
+    headers.update({str(key): str(value) for key, value in (settings.get("headers") or {}).items()})
+    response_obj = post_json(
+        runtime,
+        url=join_api_url(settings["base_url"], "chat/completions"),
+        headers=headers,
+        payload=payload,
+        timeout_seconds=timeout_seconds,
+        debug_label="openai",
+    )
+    return extract_model_response_text("openai", response_obj)
+
+
+def invoke_anthropic_model(
+    runtime: RuntimeContext,
+    *,
+    settings: dict[str, Any],
+    system_text: str,
+    user_text: str,
+    timeout_seconds: int,
+) -> str:
+    payload: dict[str, Any] = {
+        "model": settings["model"],
+        "max_tokens": settings["max_tokens"],
+        "system": system_text,
+        "messages": [
+            {
+                "role": "user",
+                "content": user_text,
+            },
+        ],
+    }
+    if settings.get("temperature") is not None:
+        payload["temperature"] = settings["temperature"]
+
+    headers = {
+        "x-api-key": settings["api_key"],
+        "anthropic-version": str(settings.get("anthropic_version") or "2023-06-01"),
+        "Content-Type": "application/json",
+    }
+    headers.update({str(key): str(value) for key, value in (settings.get("headers") or {}).items()})
+    response_obj = post_json(
+        runtime,
+        url=join_api_url(settings["base_url"], "messages"),
+        headers=headers,
+        payload=payload,
+        timeout_seconds=timeout_seconds,
+        debug_label="anthropic",
+    )
+    return extract_model_response_text("anthropic", response_obj)
+
+
+def run_api_model_step(
+    runtime: RuntimeContext,
+    *,
+    settings: dict[str, Any],
+    system_text: str,
+    user_text: str,
+    timeout_seconds: int,
+) -> Any:
+    provider = settings["provider"]
+    if provider == "openai":
+        text = invoke_openai_model(
+            runtime,
+            settings=settings,
+            messages=[
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": user_text},
+            ],
+            timeout_seconds=timeout_seconds,
+        )
+    elif provider == "anthropic":
+        text = invoke_anthropic_model(
+            runtime,
+            settings=settings,
+            system_text=system_text,
+            user_text=user_text,
+            timeout_seconds=timeout_seconds,
+        )
+    else:
+        raise RuntimeError(f"unsupported model api provider: {provider}")
+    return extract_json_object(text)
+
+
+def run_api_text_model_step(
+    runtime: RuntimeContext,
+    *,
+    settings: dict[str, Any],
+    system_text: str,
+    user_text: str,
+    timeout_seconds: int,
+) -> str:
+    provider = settings["provider"]
+    if provider == "openai":
+        return invoke_openai_model(
+            runtime,
+            settings=settings,
+            messages=[
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": user_text},
+            ],
+            timeout_seconds=timeout_seconds,
+        )
+    if provider == "anthropic":
+        return invoke_anthropic_model(
+            runtime,
+            settings=settings,
+            system_text=system_text,
+            user_text=user_text,
+            timeout_seconds=timeout_seconds,
+        )
+    raise RuntimeError(f"unsupported model api provider: {provider}")
 
 
 def invoke_gateway_tool(runtime: RuntimeContext, tool: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -245,6 +479,269 @@ def build_input_refs_text(runtime: RuntimeContext, input_refs: list[dict[str, An
         lines.append(line)
 
     return "\n".join(lines)
+
+
+def normalize_reference_registry(raw_sources: Any) -> dict[str, dict[str, Any]]:
+    if not raw_sources:
+        return {}
+    if isinstance(raw_sources, dict):
+        registry: dict[str, dict[str, Any]] = {}
+        for key, value in raw_sources.items():
+            if isinstance(value, dict):
+                item = dict(value)
+            else:
+                item = {"path": value}
+            item.setdefault("name", str(key))
+            registry[str(key)] = item
+        return registry
+    if isinstance(raw_sources, list):
+        registry = {}
+        for item in raw_sources:
+            if isinstance(item, dict):
+                name = str(item.get("name") or item.get("id") or item.get("key") or "").strip()
+                if name:
+                    registry[name] = dict(item)
+        return registry
+    return {}
+
+
+def expand_reference_source(item: Any, registry: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    if isinstance(item, str):
+        key = item.strip()
+        if not key:
+            return None
+        if key in registry:
+            return dict(registry[key])
+        return {"name": Path(key).name, "path": key}
+    if not isinstance(item, dict):
+        return None
+    source = dict(item)
+    ref_key = str(source.get("ref") or source.get("key") or "").strip()
+    if ref_key and ref_key in registry:
+        merged = dict(registry[ref_key])
+        merged.update(source)
+        merged.pop("ref", None)
+        merged.pop("key", None)
+        return merged
+    return source
+
+
+def collect_reference_sources(
+    *,
+    workflow_reference_sources: Any,
+    default_reference_sources: list[Any] | None,
+    step: dict[str, Any],
+) -> list[dict[str, Any]]:
+    registry = normalize_reference_registry(workflow_reference_sources)
+    execution = step.get("execution") or {}
+    raw_step_refs = (
+        execution.get("reference_sources")
+        or execution.get("references")
+        or step.get("reference_sources")
+        or step.get("references")
+        or []
+    )
+    if isinstance(raw_step_refs, (str, dict)):
+        raw_step_refs = [raw_step_refs]
+
+    raw_refs: list[Any] = []
+    for raw in default_reference_sources or []:
+        raw_refs.append(raw)
+    for raw in raw_step_refs or []:
+        raw_refs.append(raw)
+
+    seen: set[str] = set()
+    refs: list[dict[str, Any]] = []
+    for raw in raw_refs:
+        ref = expand_reference_source(raw, registry)
+        if not ref:
+            continue
+        identity = str(ref.get("path") or ref.get("content") or ref.get("name") or "")
+        if identity and identity in seen:
+            continue
+        if identity:
+            seen.add(identity)
+        refs.append(ref)
+    return refs
+
+
+def load_reference_text(
+    runtime: RuntimeContext,
+    *,
+    spec_dir: Path,
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    name = str(source.get("title") or source.get("name") or source.get("path") or "reference").strip()
+    description = str(source.get("description") or "").strip()
+    kind = str(source.get("kind") or "instruction").strip()
+    path_text = str(source.get("path") or "").strip()
+    content = source.get("content")
+    resolved_path: Path | None = None
+    if isinstance(content, str):
+        text = content
+    elif path_text:
+        resolved_path = resolve_step_path(runtime, spec_dir, path_text)
+        text = resolved_path.read_text(encoding=str(source.get("encoding") or "utf-8"))
+    else:
+        return {}
+
+    max_chars = source.get("max_chars")
+    truncated = False
+    if max_chars not in (None, ""):
+        limit = int(max_chars)
+        if len(text) > limit:
+            text = text[:limit]
+            truncated = True
+
+    return {
+        "name": name,
+        "description": description,
+        "kind": kind,
+        "path": str(resolved_path) if resolved_path else path_text,
+        "content": text,
+        "truncated": truncated,
+    }
+
+
+def build_reference_text(
+    runtime: RuntimeContext,
+    *,
+    spec_dir: Path,
+    references: list[dict[str, Any]],
+) -> str:
+    if not references:
+        return ""
+    sections: list[str] = []
+    for idx, source in enumerate(references, start=1):
+        loaded = load_reference_text(runtime, spec_dir=spec_dir, source=source)
+        if not loaded:
+            continue
+        header = f"### 参考 {idx}：{loaded['name']}"
+        meta_parts = []
+        if loaded.get("kind"):
+            meta_parts.append(f"类型={loaded['kind']}")
+        if loaded.get("description"):
+            meta_parts.append(f"用途={loaded['description']}")
+        if loaded.get("path"):
+            meta_parts.append(f"来源={runtime.to_output_path(Path(str(loaded['path'])))}")
+        if loaded.get("truncated"):
+            meta_parts.append("内容已按 max_chars 截断")
+        meta = f"\n{'；'.join(meta_parts)}" if meta_parts else ""
+        sections.append(f"{header}{meta}\n\n{loaded['content']}")
+    return "\n\n".join(sections)
+
+
+def format_model_data_value(value: Any) -> str:
+    if isinstance(value, str):
+        stripped = value.strip()
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            return value
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+    return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+def build_model_input_data_text(
+    runtime: RuntimeContext,
+    *,
+    refs: list[dict[str, Any]],
+    model_inputs: Any,
+) -> str:
+    if not isinstance(model_inputs, dict):
+        return format_model_data_value(model_inputs)
+    if not refs:
+        refs = [{"name": key, "kind": "raw", "description": ""} for key in model_inputs.keys()]
+    sections: list[str] = []
+    for idx, ref in enumerate(refs, start=1):
+        name = str(ref.get("name") or "").strip()
+        if not name:
+            continue
+        description = str(ref.get("description") or "").strip()
+        path_text = str(ref.get("path") or "").strip()
+        value = model_inputs.get(name)
+        header = f"### 输入 {idx}：{name}"
+        meta_parts: list[str] = []
+        if description:
+            meta_parts.append(f"含义={description}")
+        if path_text:
+            meta_parts.append(f"调试文件={runtime.to_output_path(Path(path_text))}")
+        meta = f"\n{'；'.join(meta_parts)}" if meta_parts else ""
+        sections.append(f"{header}{meta}\n\n```json\n{format_model_data_value(value)}\n```")
+    return "\n\n".join(sections)
+
+
+def write_model_prompt_audit_files(
+    runtime: RuntimeContext,
+    *,
+    step: dict[str, Any],
+    attempt: int,
+    data_dir: Path | None,
+    api_settings: dict[str, Any],
+    timeout_seconds: int,
+    system_text: str,
+    user_text: str,
+    input_refs: list[dict[str, Any]],
+    reference_sources: list[dict[str, Any]],
+) -> dict[str, Path]:
+    prompt_root = data_dir or runtime.resolve_under_state_root(".workflow-driver-internal", "model-prompts")
+    prompt_dir = prompt_root / "model-prompts" if data_dir else prompt_root
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+
+    prefix = (
+        f"step{safe_filename_part(step.get('number'))}_"
+        f"{safe_filename_part(step.get('id'))}_"
+        f"try{attempt}"
+    )
+    prompt_path = prompt_dir / f"{prefix}.prompt.md"
+    request_path = prompt_dir / f"{prefix}.request.json"
+
+    safe_api_settings = {
+        "provider": api_settings.get("provider"),
+        "model": api_settings.get("model"),
+        "base_url": api_settings.get("base_url"),
+        "max_tokens": api_settings.get("max_tokens"),
+        "max_tokens_param": api_settings.get("max_tokens_param"),
+        "temperature": api_settings.get("temperature"),
+        "timeout_seconds": timeout_seconds,
+    }
+    request_payload = {
+        "step": {
+            "id": step.get("id"),
+            "number": step.get("number"),
+            "name": step.get("name"),
+            "kind": step.get("kind"),
+        },
+        "attempt": attempt,
+        "model_api": safe_api_settings,
+        "input_refs": input_refs,
+        "reference_sources": reference_sources,
+        "messages": [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ],
+    }
+    request_path.write_text(json.dumps(request_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    prompt_text = (
+        f"# Model Prompt Audit\n\n"
+        f"- step: {step.get('number')} {step.get('name')} ({step.get('id')})\n"
+        f"- attempt: {attempt}\n"
+        f"- provider: {api_settings.get('provider')}\n"
+        f"- model: {api_settings.get('model')}\n"
+        f"- base_url: {api_settings.get('base_url')}\n"
+        f"- request_json: {runtime.to_output_path(request_path)}\n\n"
+        f"## System Prompt\n\n"
+        f"----- SYSTEM PROMPT START -----\n"
+        f"{system_text}\n"
+        f"----- SYSTEM PROMPT END -----\n\n"
+        f"## User Prompt\n\n"
+        f"----- USER PROMPT START -----\n"
+        f"{user_text}\n"
+        f"----- USER PROMPT END -----\n"
+    )
+    prompt_path.write_text(prompt_text, encoding="utf-8")
+    return {"prompt_path": prompt_path, "request_path": request_path}
 
 
 def materialize_input_refs(
@@ -506,6 +1003,8 @@ def execute_model_step(
     spec_dir: Path,
     raw_inputs: dict[str, Any],
     input_refs: list[dict[str, Any]] | None,
+    workflow_reference_sources: Any = None,
+    default_reference_sources: list[Any] | None = None,
     run_id: str,
     skill: str,
     timeout_seconds: int = 600,
@@ -513,26 +1012,47 @@ def execute_model_step(
 ) -> Any:
     execution = step.get("execution") or {}
     model_cfg = execution.get("model") or {}
-    agent = model_cfg.get("agent") or step.get("actor")
-    if not agent:
-        raise RuntimeError(f'model step {step["id"]} missing execution.model.agent')
+    agent = model_cfg.get("agent") or step.get("actor") or "model"
+    api_settings = runtime.load_model_api_settings(model_cfg)
+    api_timeout_seconds = int(api_settings.get("timeout_seconds") or timeout_seconds)
 
     prompt_text = step.get("prompt_text") or ""
+    model_inputs = build_model_input(
+        runtime,
+        step=step,
+        spec_dir=spec_dir,
+        raw_inputs=raw_inputs,
+    )
     refs = list(input_refs or [])
-    if not refs:
-        refs = [{"name": key, "kind": "raw", "description": ""} for key in raw_inputs.keys()]
+    if not isinstance(model_inputs, dict):
+        model_inputs = {"input": model_inputs}
+        refs = [{"name": "input", "kind": "prepared", "description": "模型输入"}]
+    elif not refs or set(ref.get("name") for ref in refs if ref.get("name")) - set(model_inputs.keys()):
+        refs = [{"name": key, "kind": "prepared", "description": ""} for key in model_inputs.keys()]
     refs = materialize_input_refs(
         runtime,
         step=step,
-        raw_inputs=raw_inputs,
+        raw_inputs=model_inputs,
         input_refs=refs,
         data_dir=data_dir,
     )
     input_refs_text = build_input_refs_text(runtime, refs)
+    input_data_text = build_model_input_data_text(runtime, refs=refs, model_inputs=model_inputs)
+    reference_sources = collect_reference_sources(
+        workflow_reference_sources=workflow_reference_sources,
+        default_reference_sources=default_reference_sources,
+        step=step,
+    )
+    reference_text = build_reference_text(
+        runtime,
+        spec_dir=spec_dir,
+        references=reference_sources,
+    )
 
     stderr_log(
-        f'[model] 准备调用模型 {agent} 处理第{step["number"]}步 {step["name"]} '
-        f"(input_refs={len(refs)})"
+        f'[model] 准备调用 {api_settings["provider"]}/{api_settings["model"]} '
+        f'处理第{step["number"]}步 {step["name"]} '
+        f"(input_refs={len(refs)}, references={len(reference_sources)})"
     )
     materialized_refs = [ref for ref in refs if ref.get("materialized")]
     if materialized_refs:
@@ -545,18 +1065,36 @@ def execute_model_step(
             f'[model] 第{step["number"]}步 {step["name"]} '
             f'materialized {len(materialized_refs)} 个输入文件: {materialized_summary}'
         )
+    system_parts = [
+        (
+            "你是 workflow-driver 直接通过 API 调用的模型执行器。"
+            "请用中文完成当前股票复盘步骤；不要调用工具，不要读取外部文件，"
+            "不要引入本次输入和参考材料之外的新事实。"
+        ),
+        f"当前步骤原 actor/角色标识：{agent}。",
+    ]
+    if reference_text:
+        system_parts.append(
+            "以下内容属于行事方式、判断方法和风险约束，优先用于约束分析口径；"
+            "它们不是行情数据，不要在最终 JSON 中机械复述文档名或执行链路。\n\n"
+            f"{reference_text}"
+        )
+    system_text = "\n\n".join(system_parts)
     message_template = model_cfg.get("message_template") or (
         "你在执行 workflow 的第{step_number}步：{step_name}（skill={skill}）。\n\n"
         "任务要求：\n{prompt_text}\n\n"
-        "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于下列输入文件中的数据，不得读取或引用其他来源。\n\n"
-        "依赖输入文件：\n{input_refs_text}\n\n"
-        "请逐个读取上述输入文件获取所需数据；若某项只是源文件中的一部分，driver 已将该部分单独物化为输入文件。\n\n"
+        "输出规则：只输出严格 JSON，不要解释；所有判断必须严格基于下列已内联输入数据和系统参考材料，不得读取或引用其他来源。\n\n"
+        "依赖输入清单：\n{input_refs_text}\n\n"
+        "依赖输入数据：\n{input_data_text}\n\n"
+        "请基于上面的数据完成任务，最后只返回一个可被 JSON.parse 解析的 JSON 对象。\n\n"
     )
     base_message = message_template.format(
         step_number=step["number"],
         step_name=step["name"],
         step_id=step["id"],
         input_refs_text=input_refs_text or "- 无输入文件",
+        input_data_text=input_data_text or "- 无输入数据",
+        reference_text=reference_text or "- 无参考文档",
         prompt_text=prompt_text,
         skill=skill,
     )
@@ -580,23 +1118,52 @@ def execute_model_step(
             )
         else:
             stderr_log(f'[model] 第{step["number"]}步 {step["name"]} 发起模型请求，第 {attempt} 次尝试')
+        audit_paths = write_model_prompt_audit_files(
+            runtime,
+            step=step,
+            attempt=attempt,
+            data_dir=data_dir,
+            api_settings=api_settings,
+            timeout_seconds=api_timeout_seconds,
+            system_text=system_text,
+            user_text=message,
+            input_refs=refs,
+            reference_sources=reference_sources,
+        )
+        stderr_log(
+            f'[model] 第{step["number"]}步 {step["name"]} 已记录请求 prompt: '
+            f'{runtime.to_output_path(audit_paths["prompt_path"])}'
+        )
         if runtime.debug:
             stderr_log(
                 f'[debug][model] 第{step["number"]}步 {step["name"]} 第 {attempt} 次尝试完整请求参数:\n'
-                f"  agent={agent}\n"
-                f"  session_label={session_label}-try{attempt}\n"
+                f"  provider={api_settings['provider']}\n"
+                f"  model={api_settings['model']}\n"
+                f"  request_label={session_label}-try{attempt}\n"
                 f"  workspace={runtime.workspace}\n"
-                f"  timeout_seconds={timeout_seconds}\n"
+                f"  timeout_seconds={api_timeout_seconds}\n"
+                f"  system=\n{system_text}\n"
                 f"  message=\n{message}"
             )
-        obj = run_session_model_step(
-            runtime,
-            agent,
-            message,
-            workspace=str(runtime.workspace),
-            timeout_seconds=timeout_seconds,
-            session_label=f"{session_label}-try{attempt}",
-        )
+        try:
+            obj = run_api_model_step(
+                runtime,
+                settings=api_settings,
+                system_text=system_text,
+                user_text=message,
+                timeout_seconds=api_timeout_seconds,
+            )
+        except Exception as exc:
+            last_error = exc
+            stderr_log(
+                f'[model] 第{step["number"]}步 {step["name"]} '
+                f'第 {attempt} 次尝试模型请求/JSON 解析失败: {exc}'
+            )
+            if attempt > MODEL_SCHEMA_RETRY_LIMIT:
+                raise RuntimeError(
+                    f"model request or JSON parsing failed after {attempt} attempts: {exc}"
+                ) from exc
+            continue
         if runtime.debug:
             stderr_log(
                 f'[debug][model] 第{step["number"]}步 {step["name"]} 第 {attempt} 次尝试完整返回:\n'
@@ -630,7 +1197,7 @@ def execute_model_step(
     raise RuntimeError(f"model output schema validation failed: {last_error}")
 
 
-def execute_final_step(
+def build_final_prompt_package(
     *,
     step: dict[str, Any],
     resolved_inputs: dict[str, Any],
@@ -653,3 +1220,145 @@ def execute_final_step(
         "data_refs": data_refs,
         "data_map": data_map,
     }
+
+
+def should_render_final_with_model(step: dict[str, Any]) -> bool:
+    execution = step.get("execution") or {}
+    mode = str(execution.get("mode") or "").strip().lower()
+    output_mode = str(execution.get("output_mode") or step.get("output_mode") or "").strip().lower()
+    return mode == "model" or output_mode in {"model", "model_text", "text_model", "final_text"}
+
+
+def execute_final_step(
+    runtime: RuntimeContext,
+    *,
+    step: dict[str, Any],
+    spec_dir: Path,
+    resolved_inputs: dict[str, Any],
+    workflow_reference_sources: Any = None,
+    default_reference_sources: list[Any] | None = None,
+    run_id: str,
+    skill: str,
+    timeout_seconds: int = 600,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    prompt_package = build_final_prompt_package(step=step, resolved_inputs=resolved_inputs)
+    if not should_render_final_with_model(step):
+        return prompt_package
+
+    execution = step.get("execution") or {}
+    model_cfg = execution.get("model") or {}
+    agent = model_cfg.get("agent") or step.get("actor") or "model"
+    api_settings = runtime.load_model_api_settings(model_cfg)
+    api_timeout_seconds = int(api_settings.get("timeout_seconds") or timeout_seconds)
+
+    reference_sources = collect_reference_sources(
+        workflow_reference_sources=workflow_reference_sources,
+        default_reference_sources=default_reference_sources,
+        step=step,
+    )
+    reference_text = build_reference_text(
+        runtime,
+        spec_dir=spec_dir,
+        references=reference_sources,
+    )
+    system_parts = [
+        (
+            "你是 workflow-driver 直接通过 API 调用的最终回复生成模型。"
+            "请用中文输出最终用户可直接阅读的股票复盘正文；不要调用工具，"
+            "不要读取外部文件，不要引入本次输入和参考材料之外的新事实。"
+        ),
+        "只输出最终正文，不要输出 JSON，不要输出 Markdown 代码块，不要解释执行过程。",
+        f"当前步骤原 actor/角色标识：{agent}。",
+    ]
+    if reference_text:
+        system_parts.append(
+            "以下内容属于行事方式、判断方法和风险约束，优先用于约束最终表达口径；"
+            "它们不是行情数据，不要在最终正文中机械复述文档名或执行链路。\n\n"
+            f"{reference_text}"
+        )
+    system_text = "\n\n".join(system_parts)
+
+    message_template = model_cfg.get("message_template") or "{final_prompt}"
+    user_text = message_template.format(
+        final_prompt=prompt_package["final_prompt"],
+        data_refs="、".join(prompt_package.get("data_refs") or []),
+        skill=skill,
+        step_number=step["number"],
+        step_name=step["name"],
+        step_id=step["id"],
+        run_id=run_id,
+    )
+
+    stderr_log(
+        f'[final] 准备调用 {api_settings["provider"]}/{api_settings["model"]} '
+        f'生成第{step["number"]}步 {step["name"]} 最终正文'
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, MODEL_SCHEMA_RETRY_LIMIT + 2):
+        if attempt > 1:
+            retry_reason = str(last_error) if last_error else "模型请求失败"
+            stderr_log(
+                f'[final] 第{step["number"]}步 {step["name"]} '
+                f'发起第 {attempt} 次重试，上次失败原因: {retry_reason}'
+            )
+        else:
+            stderr_log(f'[final] 第{step["number"]}步 {step["name"]} 发起最终正文模型请求')
+
+        audit_paths = write_model_prompt_audit_files(
+            runtime,
+            step=step,
+            attempt=attempt,
+            data_dir=data_dir,
+            api_settings=api_settings,
+            timeout_seconds=api_timeout_seconds,
+            system_text=system_text,
+            user_text=user_text,
+            input_refs=[
+                {
+                    "name": name,
+                    "kind": "final_data",
+                    "description": f"最终渲染数据：{name}",
+                }
+                for name in prompt_package.get("data_refs", [])
+            ],
+            reference_sources=reference_sources,
+        )
+        stderr_log(
+            f'[final] 第{step["number"]}步 {step["name"]} 已记录最终请求 prompt: '
+            f'{runtime.to_output_path(audit_paths["prompt_path"])}'
+        )
+        try:
+            final_text = run_api_text_model_step(
+                runtime,
+                settings=api_settings,
+                system_text=system_text,
+                user_text=user_text,
+                timeout_seconds=api_timeout_seconds,
+            ).strip()
+        except Exception as exc:
+            last_error = exc
+            stderr_log(
+                f'[final] 第{step["number"]}步 {step["name"]} '
+                f'第 {attempt} 次最终正文模型请求失败: {exc}'
+            )
+            if attempt > MODEL_SCHEMA_RETRY_LIMIT:
+                raise RuntimeError(f"final text model request failed after {attempt} attempts: {exc}") from exc
+            continue
+        if not final_text:
+            last_error = RuntimeError("empty final text")
+            if attempt > MODEL_SCHEMA_RETRY_LIMIT:
+                raise RuntimeError("final text model returned empty output")
+            continue
+        stderr_log(f'[final] 第{step["number"]}步 {step["name"]} 最终正文生成完成')
+        return {
+            **prompt_package,
+            "final_text": final_text,
+            "final_message": final_text,
+            "model_api": {
+                "provider": api_settings.get("provider"),
+                "model": api_settings.get("model"),
+                "base_url": api_settings.get("base_url"),
+            },
+        }
+    raise RuntimeError(f"final text model request failed: {last_error}")

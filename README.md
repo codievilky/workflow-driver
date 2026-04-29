@@ -8,7 +8,9 @@
 - 支持指定目标步骤 `--step-number`
 - 支持基于 `input_sources` 自动回溯依赖
 - 支持复用 `data-dir` 下已有产物
-- 模型步骤直接把真实 JSON 输入内联进 prompt，而不是只传一个本地文件路径
+- 模型步骤通过 OpenAI / Anthropic 兼容 API 直接执行
+- 模型步骤会把参考文档和真实 JSON 输入内联进请求，而不是让外部 agent 自己读文件
+- 最终结果可通过 HTTP `text/plain` POST 通知
 
 ## 安装
 
@@ -45,7 +47,7 @@ workflow-driver run
 - `--context key=value`：补充任意 context 参数，值支持 JSON
 - `--output`：将本次执行结果写到 JSON 文件
 - `--force`：忽略现有产物并强制重跑
-- `--gateway-url` / `--gateway-token`：模型步骤网关配置
+- `--config` / `--gateway-config`：运行配置文件，默认 `~/.workflow-driver/config.json`
 
 ## 执行语义
 
@@ -69,10 +71,17 @@ driver 会在 `data-dir` 中查找步骤默认产物名：
 
 1. 根据 `input_sources` 解析真实输入
 2. 如果步骤定义了 `input_builder`，先运行 builder 生成模型输入
-3. 将最终 JSON 输入直接内联到 prompt 中
-4. 再调用模型
+3. 读取 workflow 级和步骤级 `reference_sources`
+4. 按“行事规则 / 判断参考 → 当前任务 → 依赖数据”的优先级组装请求
+5. 将每次模型尝试的 prompt 审计文件写入 `data-dir/model-prompts/`
+6. 通过配置中的 OpenAI / Anthropic API 调用模型
 
 这意味着模型不再依赖“自己去读本地 JSON 文件路径”。
+
+每次模型请求会写两类审计文件：
+
+- `stepN_<step_id>_tryK.prompt.md`：适合人工阅读和优化 prompt。
+- `stepN_<step_id>_tryK.request.json`：包含 provider、model、base_url、输入引用、参考文档引用和 system/user messages；不会写入 API key。
 
 ## 路径解析规则
 
@@ -158,32 +167,63 @@ driver 会自动复用 `step1`，只执行 `step2`。
 
 执行过程中的步骤播报、读取文件、生成文件信息会输出到 `stderr`，不会混入默认 JSON 输出。
 
-## 模型网关配置
+## 模型 API 配置
 
-模型步骤通过 gateway 调用远端会话工具。
+模型步骤默认直接调用配置文件中的模型 API，不再通过 openclaw / gateway 子会话。
 
-可通过以下方式提供配置：
+默认配置文件路径：
 
-- CLI：`--gateway-url`、`--gateway-token`
-- 环境变量：`WORKFLOW_DRIVER_GATEWAY_URL`、`WORKFLOW_DRIVER_GATEWAY_TOKEN`
-- 配置文件：`~/.workflow-driver/config.json`
+```bash
+~/.workflow-driver/config.json
+```
 
-优先级：CLI > 环境变量 > 配置文件
-
-配置文件示例：
+OpenAI / OpenAI-compatible 示例：
 
 ```json
 {
-  "gateway": {
-    "url": "http://localhost:18789/tools/invoke",
-    "auth": {
-      "token": "your-token"
-    }
+  "model_api": {
+    "api_type": "openai",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "your-api-key",
+    "model": "your-model",
+    "max_tokens_param": "max_tokens",
+    "max_tokens": 8192,
+    "temperature": 0
+  },
+  "notification": {
+    "url": "http://192.168.50.128:8111/message/send_info",
+    "enabled": true
   }
 }
 ```
 
-兼容旧格式：
+Anthropic 示例：
+
+```json
+{
+  "model_api": {
+    "api_type": "anthropic",
+    "base_url": "https://api.anthropic.com/v1",
+    "api_key": "your-api-key",
+    "model": "your-model",
+    "max_tokens": 8192,
+    "temperature": 0
+  }
+}
+```
+
+可用环境变量覆盖模型 API 的关键项：
+
+- `WORKFLOW_DRIVER_MODEL_API_TYPE`
+- `WORKFLOW_DRIVER_MODEL_BASE_URL`
+- `WORKFLOW_DRIVER_MODEL_API_KEY`
+- `WORKFLOW_DRIVER_MODEL_NAME`
+
+如果你的 OpenAI-compatible 接口使用 `max_completion_tokens` 而不是 `max_tokens`，把 `model_api.max_tokens_param` 改成对应字段即可。
+
+### 兼容旧 gateway
+
+旧 gateway 配置仍可被底层兼容函数读取，但默认模型步骤已经不再使用它：
 
 ```json
 {
@@ -195,6 +235,46 @@ driver 会自动复用 `step1`，只执行 `step2`。
   }
 }
 ```
+
+## 参考文档配置
+
+workflow 可以在顶层注册参考文档，并为每个模型步骤声明需要的文档：
+
+```yaml
+reference_sources:
+  stock_rules:
+    path: ../../AGENTS.md
+    kind: instruction
+    description: 通用股票复盘规则与标的选择红线。
+  emotion_rules:
+    path: ../../references/情绪.md
+    kind: instruction
+    description: 情绪周期和操作节奏判断方法。
+default_reference_sources:
+  - stock_rules
+
+steps:
+  - id: step_2_emotion_regime
+    kind: model
+    execution:
+      reference_sources:
+        - emotion_rules
+```
+
+参考文档被当作“行事方式 / 判断方法”，会放在行情数据之前；`input_sources` 解析出来的数据会放在最后，作为事实依据。
+
+## 最终通知
+
+当最终步骤产物包含 `final_text` / `final_message` 时，driver 会将最终正文原样 POST 到通知地址。
+兼容旧 workflow：如果只有 `final_prompt`，才会退回通知 prompt。
+
+```bash
+curl -X POST http://192.168.50.128:8111/message/send_info \
+  -H "Content-Type: text/plain" \
+  --data-raw "message"
+```
+
+通知地址可通过 `notification.url` 或 `WORKFLOW_DRIVER_NOTIFY_URL` 覆盖；通知失败不会中断 workflow，结果中会记录 `notification_status`。
 
 ## 脚本执行契约
 
@@ -225,7 +305,9 @@ export WORKFLOW_DRIVER_SCRIPT_COMMAND='python {script_path} --input {input_path}
 - `--step-number` 单步目标执行
 - `data-dir` 产物复用
 - 依赖回溯
-- model step 真实 JSON 内联 prompt
+- model step 直接调用 OpenAI / Anthropic API
+- reference 文档与真实 JSON 输入内联请求
+- final text HTTP 通知
 
 ## 后续建议
 

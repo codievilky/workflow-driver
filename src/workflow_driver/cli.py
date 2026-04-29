@@ -47,9 +47,17 @@ def parse_mapping_items(items: list[str] | None) -> dict[str, Any]:
 def add_runtime_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--workspace", help="Workspace root. Defaults to the directory containing --spec.")
     parser.add_argument("--state-root", help="Driver internal state root. Defaults to <workspace>/tmp.")
-    parser.add_argument("--gateway-url", help="Gateway URL for model-step execution.")
-    parser.add_argument("--gateway-token", help="Gateway bearer token for model-step execution.")
-    parser.add_argument("--gateway-config", help="Gateway config JSON path. Defaults to ~/.workflow-driver/config.json.")
+    parser.add_argument("--gateway-url", help="Legacy gateway URL for model-step execution.")
+    parser.add_argument("--gateway-token", help="Legacy gateway bearer token for model-step execution.")
+    parser.add_argument(
+        "--config",
+        "--gateway-config",
+        dest="gateway_config",
+        help=(
+            "Runtime config JSON path. Defaults to ~/.workflow-driver/config.json. "
+            "Direct model API settings are read from model_api in this file."
+        ),
+    )
     parser.add_argument(
         "--script-command-template",
         help=(
@@ -84,8 +92,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--context-file", help="JSON object file merged into context values.")
     run_parser.add_argument("--context", action="append", help="Context key=value pair. Value supports JSON.")
     run_parser.add_argument("--skill", required=True, help="Skill name that identifies this workflow invocation.")
-    run_parser.add_argument("--callback-session-id", help="Optional callback session id for final prompt delivery.")
-    run_parser.add_argument("--callback-session-key", help="Optional callback routing key for final prompt delivery.")
+    run_parser.add_argument("--callback-session-id", help="Legacy callback session id; HTTP notification no longer requires it.")
+    run_parser.add_argument("--callback-session-key", help="Legacy callback routing key; HTTP notification no longer requires it.")
     run_parser.add_argument("--force", action="store_true", help="Force re-execution even if artifacts already exist.")
     add_runtime_options(run_parser)
 

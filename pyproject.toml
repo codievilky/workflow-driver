@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "workflow-driver"
 version = "0.1.11"
-description = "Generic workflow driver with step orchestration, script execution, and model-step bridging."
+description = "Generic workflow driver with step orchestration, script execution, and direct model API calls."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
